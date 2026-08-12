@@ -14,6 +14,7 @@
 | [docs/00-original-handoff.md](docs/00-original-handoff.md) | 元の設計引継ぎ書（プロダクト方針・スコア設計・表示ポリシー・研究的根拠） |
 | [docs/01-spot-granularity.md](docs/01-spot-granularity.md) | **スポット粒度設計** — 同定アルゴリズム、方位セクター、粒度バージョニング、再計算ジョブ |
 | [docs/02-azure-architecture.md](docs/02-azure-architecture.md) | **Azureインフラ構成** — 採点パイプライン、推論ホスティング、データストア選定、③の遅延集計 |
+| [docs/03-remaining-tasks.md](docs/03-remaining-tasks.md) | **残タスク一覧** — レビュー指摘の未対応分を含む |
 
 ## 実装
 
