@@ -16,6 +16,7 @@ Instagram はフォロワー数が権力になる構造で後発ユーザーが�
 | [docs/01-spot-granularity.md](docs/01-spot-granularity.md) | スポット粒度設計。同定アルゴリズム、方位、バージョニング |
 | [docs/02-azure-architecture.md](docs/02-azure-architecture.md) | Azureインフラ構成。パイプライン、推論、データストア |
 | [docs/03-remaining-tasks.md](docs/03-remaining-tasks.md) | **残タスク一覧**（Notion と同じ内容） |
+| [docs/04-security-design.md](docs/04-security-design.md) | **セキュリティ設計**。要件ID（SEC-XX-nn）と受け入れ条件付き。T-03/T-04 の設計を含む |
 
 設計レビュー指摘書が Notion にある（B-01〜B-12）。**未対応の指摘が残っているので、
 新しい設計判断をする前に docs/03 の Phase 0 を確認すること。**
@@ -37,6 +38,17 @@ Instagram はフォロワー数が権力になる構造で後発ユーザーが�
 
 「便利だから」と `posts.spot_id` や `posts.rarity_score` を足したくなるが、足した瞬間に
 この設計は死ぬ。レビューする際もここを最優先で見ること。
+
+### セキュリティ実装のルール（docs/04 が正）
+
+セキュリティに関わるコードを書く・レビューするときは docs/04 の要件ID（`SEC-XX-nn`）を
+コミット・PRに引用し、受け入れ条件のテストを同じPRに含めること。特に:
+
+- **表示座標の劣化はグリッドスナップ（H3セル中心）。ランダムジッターは禁止**
+  （複数投稿の平均で元座標が復元できるため。SEC-PRIV-02）
+- **生の合計点・Elo・trust_score を返すAPIを作らない**（SEC-API-03）
+- **投票ペアはサーバーが選ぶ。**クライアントがペアを指定できるAPIを作らない（SEC-VOTE-01）
+- **ログに生座標・トークン・メールを書かない**（SEC-OPS-02）
 
 ### 表示ポリシー（引継ぎ書§3・変更禁止）
 
