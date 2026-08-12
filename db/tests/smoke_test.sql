@@ -61,22 +61,32 @@ SELECT 'user' || i, 'テストユーザー' || i FROM generate_series(1, 8) i;
 INSERT INTO t_ids
 SELECT 'spot_a', gen_random_uuid();
 
--- 富士山周辺を想定したダミー座標（H3インデックスは本来アプリ層で計算する）
-INSERT INTO spots (id, grain_version_id, kind, h3_index, centroid,
-                   display_name, name_source, poi_source, poi_external_id)
+-- 富士山周辺を想定したダミー座標（H3インデックスは本来アプリ層で計算する）。
+-- スポットは粒度バージョンごとの「実体」なので、先に永続ID（spot_identity）を発行する（T-01）。
+INSERT INTO spot_identity (slug, canonical_name, name_source, source_code, representative_point)
+VALUES ('tenbodai-a', '◯◯展望台', 'poi', 'azure_maps',
+        ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography);
+
+INSERT INTO t_ids
+SELECT 'identity_a', id FROM spot_identity WHERE slug = 'tenbodai-a';
+
+INSERT INTO spots (id, identity_id, grain_version_id, kind, h3_index, centroid,
+                   display_name, name_source, poi_source, source_code, poi_external_id)
 SELECT (SELECT v FROM t_ids WHERE k = 'spot_a'),
+       (SELECT v FROM t_ids WHERE k = 'identity_a'),
        (SELECT v FROM t_grain WHERE k = 'grain'),
        'poi', 617700169958293503,
        ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography,
-       '◯◯展望台', 'poi', 'azure_maps', 'poi-test-0001';
+       '◯◯展望台', 'poi', 'azure_maps', 'azure_maps', 'poi-test-0001';
 
 -- kind='poi' なのに出自が無いスポットは作れない
 DO $$
 DECLARE v_ok boolean := false;
 BEGIN
     BEGIN
-        INSERT INTO spots (grain_version_id, kind, h3_index, centroid)
-        VALUES ((SELECT v FROM t_grain WHERE k = 'grain'), 'poi', 617700169958293504,
+        INSERT INTO spots (identity_id, grain_version_id, kind, h3_index, centroid)
+        VALUES ((SELECT v FROM t_ids WHERE k = 'identity_a'),
+                (SELECT v FROM t_grain WHERE k = 'grain'), 'poi', 617700169958293504,
                 ST_SetSRID(ST_MakePoint(138.72, 35.36), 4326)::geography);
     EXCEPTION WHEN check_violation THEN
         v_ok := true;
@@ -329,10 +339,12 @@ DECLARE
     v_ruleset smallint := (SELECT id FROM scoring_rulesets WHERE is_active);
     i        integer;
 BEGIN
-    -- 同一ファセットに6件（足切り5件を超える）を作る
+    -- 同一ファセットに6件（足切り5件を超える）を作る。
+    -- 投稿者は3人に散らす。1人の連投ではランキングを成立させない（T-02 / B-03）ため、
+    -- 全件を同一ユーザーにするとこのファセットは発見表現へ落ちる。
     FOR i IN 1..6 LOOP
         INSERT INTO posts (author_id, status, captured_at, posted_at, weather, timeslot, season)
-        VALUES ((SELECT id FROM users WHERE handle = 'user7'), 'published',
+        VALUES ((SELECT id FROM users WHERE handle = 'user' || (1 + i % 3)), 'published',
                 now(), now(), 'clear', 'golden', 'summer')
         RETURNING id INTO v_post;
 
@@ -405,6 +417,105 @@ BEGIN
           WHERE table_name = 'v_post_display'
             AND column_name IN ('total_score', 'ai_score', 'rarity_score', 'community_score')),
         0, '公開ビューは生の合計点を一切含まない（docs/00 §3 変更禁止）');
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_name = 'v_post_recognition'
+            AND column_name IN ('total_score', 'ai_score', 'rarity_score', 'community_score')),
+        0, '統合ビューも生の合計点を一切含まない');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 9b. T-02 フォールバック階段と発見表現 =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_grain  smallint := (SELECT v FROM t_grain WHERE k = 'grain');
+    v_spot   uuid     := (SELECT v FROM t_ids   WHERE k = 'spot_a');
+    v_period integer  := (SELECT id FROM ranking_periods
+                           WHERE kind = 'weekly' ORDER BY starts_at DESC LIMIT 1);
+    v_post   uuid;
+    i        integer;
+    v_rows   integer;
+BEGIN
+    -- 母数2件の fog ファセットは、どの段まで落ちても成立しない → 発見表現へ
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM post_discovery_labels
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        2, 'どの段でも成立しないファセットの投稿は発見表現に落ちる');
+
+    PERFORM assert_eq(
+        (SELECT DISTINCT kind FROM post_discovery_labels
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        'new_scenery'::discovery_kind, '累計投稿の少ないスポットは「新しい景色」として出す');
+
+    -- 完了条件: 順位を出すか発見表現にするかが投稿ごとに一意に決まる
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_post_recognition
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        8, '期間内の全投稿がちょうど1行ずつ統合ビューに出る');
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM (
+            SELECT post_id FROM v_post_recognition
+             WHERE period_id = v_period AND grain_version_id = v_grain
+             GROUP BY post_id HAVING count(*) > 1
+         ) dup),
+        0, '順位と発見表現が同じ投稿に二重に付くことはない');
+
+    -- 1人の連投ではランキングを成立させない（B-03）
+    -- 同一ユーザーだけで7件を別ファセットに積んでも、投稿者数の下限3人に届かない
+    FOR i IN 1..7 LOOP
+        INSERT INTO posts (author_id, status, captured_at, posted_at, weather, timeslot, season)
+        VALUES ((SELECT id FROM users WHERE handle = 'user8'), 'published',
+                now(), now(), 'rain', 'dusk', 'summer')
+        RETURNING id INTO v_post;
+
+        INSERT INTO post_spot_assignment (post_id, grain_version_id, spot_id, h3_index,
+                                          bearing_sector, bind_method)
+        VALUES (v_post, v_grain, v_spot, 617700169958293503, 3, 'poi');
+
+        INSERT INTO post_ai_scores (post_id, model_bundle_version, ai_score)
+        VALUES (v_post, 'test-v1', 20 + i);
+    END LOOP;
+
+    v_rows := rebuild_ranking_entries(v_period, v_grain);
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM ranking_entries
+          WHERE period_id = v_period AND grain_version_id = v_grain AND weather = 'rain'),
+        0, '投稿数を満たしても投稿者が1人ならランキングは成立しない');
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM post_discovery_labels
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        9, '連投で弾かれた投稿も発見表現で受け止める');
+
+    -- 階段の段数が記録され、粗い段に落ちたことが後から分かる
+    PERFORM assert_eq(
+        (SELECT DISTINCT facet_level FROM ranking_entries
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        1::smallint, '最も細かい段で成立したファセットは level=1 で記録される');
+
+    -- 同一投稿に2つの順位を持たせない（T-02 の完了条件を制約で守る）
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            INSERT INTO ranking_entries (
+                period_id, grain_version_id, spot_id, spot_identity_id, facet_level,
+                post_id, rank, facet_post_count, top_percentile, total_score
+            )
+            SELECT period_id, grain_version_id, spot_id, spot_identity_id, 3,
+                   post_id, 1, 9, 0.1, 50
+              FROM ranking_entries
+             WHERE period_id = v_period AND grain_version_id = v_grain LIMIT 1;
+        EXCEPTION WHEN unique_violation THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '1投稿に対して順位は1つしか持てない');
+    END;
 END;
 $$;
 
@@ -427,8 +538,11 @@ BEGIN
     ) VALUES ('g2-h3r10-sector8', 'shadow', 10, 60, 150, 8, 50, 5, 3, 100)
     RETURNING id INTO v_new;
 
-    INSERT INTO spots (id, grain_version_id, kind, h3_index, centroid)
-    VALUES (v_spot_new, v_new, 'h3_cell', 622700169958293503,
+    -- 新しい粒度バージョンでも同じ場所は同じ永続IDを引き継ぐ。
+    -- これが T-01 の要点で、引き継がないとURLと称号が切れる。
+    INSERT INTO spots (id, identity_id, grain_version_id, kind, h3_index, centroid)
+    VALUES (v_spot_new, (SELECT v FROM t_ids WHERE k = 'identity_a'),
+            v_new, 'h3_cell', 622700169958293503,
             ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography);
 
     -- 同じ投稿が新旧2つのバージョンに同時に紐づく（不変条件 I-2）
@@ -471,6 +585,155 @@ DECLARE v_cnt int;
 BEGIN
     SELECT count(*)::int INTO v_cnt FROM v_grain_health;
     PERFORM assert_true(v_cnt >= 2, 'v_grain_health が全バージョンぶん集計される');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 12. T-01 永続IDは粒度変更をまたいで生き残る =='
+-- ===========================================================================
+-- ここに到達した時点で、section 10 が active を g1 → g2 に差し替えている。
+-- 「粒度を変更しても、スポットのURLと称号履歴が維持される」が T-01 の完了条件。
+DO $$
+DECLARE
+    v_identity uuid := (SELECT v FROM t_ids WHERE k = 'identity_a');
+BEGIN
+    PERFORM assert_eq(
+        (SELECT code FROM spot_grain_versions WHERE status = 'active'),
+        'g2-h3r10-sector8', '前提: 粒度は g2 に切り替わっている');
+
+    -- URL
+    PERFORM assert_eq(resolve_spot_slug('tenbodai-a'), v_identity,
+        '粒度を切り替えてもスポットのURLは同じ identity に解決する');
+
+    -- 称号履歴（旧粒度で取った1位が残っている）
+    PERFORM assert_true(
+        (SELECT count(*) FROM v_spot_titles WHERE spot_identity_id = v_identity) > 0,
+        '粒度を切り替えても過去の称号が残る');
+
+    PERFORM assert_eq(
+        (SELECT DISTINCT rank FROM v_spot_titles WHERE spot_identity_id = v_identity),
+        1, '称号ビューは1位だけを返す（下位順位を漏らさない）');
+
+    -- スポット詳細ページは新しい粒度の実体を見る
+    PERFORM assert_eq(
+        (SELECT grain_version_id FROM v_spot_public WHERE identity_id = v_identity),
+        (SELECT id FROM spot_grain_versions WHERE status = 'active'),
+        'スポット詳細は常にアクティブな粒度の実体を返す');
+
+    PERFORM assert_eq(
+        (SELECT display_name FROM v_spot_public WHERE identity_id = v_identity),
+        '◯◯展望台', '新しい粒度の実体が未命名でも、永続IDの名前が表示に残る');
+
+    -- 同一粒度に同じ identity の実体は1つだけ
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            INSERT INTO spots (identity_id, grain_version_id, kind, h3_index, centroid)
+            VALUES (v_identity, (SELECT id FROM spot_grain_versions WHERE status = 'active'),
+                    'h3_cell', 622700169958293999,
+                    ST_SetSRID(ST_MakePoint(138.73, 35.36), 4326)::geography);
+        EXCEPTION WHEN unique_violation THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '1つの粒度バージョンに同じ永続IDの実体は1つしか作れない');
+    END;
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 13. T-01 改名・統合・系譜 =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_identity uuid := (SELECT v FROM t_ids WHERE k = 'identity_a');
+    v_grain    smallint := (SELECT id FROM spot_grain_versions WHERE status = 'active');
+    v_other    uuid;
+    v_spot     uuid;
+BEGIN
+    -- 改名しても旧名で辿れる
+    PERFORM rename_spot_identity(v_identity, '△△パノラマ台', 'user');
+    PERFORM assert_eq(
+        (SELECT canonical_name FROM spot_identity WHERE id = v_identity),
+        '△△パノラマ台', '命名が採用されると表示名が変わる');
+    PERFORM assert_true(
+        (SELECT count(*) FROM spot_alias
+          WHERE identity_id = v_identity AND alias_kind = 'display_name'
+            AND alias_value = '◯◯展望台') = 1,
+        '旧名は alias に退避され、検索から消えない');
+
+    -- 日本語名は URL に使えないので座標を種にする
+    PERFORM assert_true(
+        generate_spot_slug('◯◯展望台',
+            ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography) ~ '^spot-',
+        'ASCIIに落ちない表示名のときは座標由来の slug を作る');
+
+    -- 新しいスポットを親付きで作ると系譜が繋がる
+    v_spot := upsert_spot_with_identity(
+        v_grain, 'cluster', 622700169958294111,
+        ST_SetSRID(ST_MakePoint(138.7280, 35.3610), 4326)::geography,
+        'テスト昇格スポット', 'user', 'user', NULL, NULL, 'create');
+
+    SELECT identity_id INTO v_other FROM spots WHERE id = v_spot;
+    PERFORM assert_true(v_other IS DISTINCT FROM v_identity,
+        '親を指定しなければ新しい永続IDが発行される');
+    PERFORM assert_eq(
+        (SELECT op FROM spot_lineage WHERE child_identity_id = v_other),
+        'create'::spot_lineage_op, '新規スポットは系譜に create として残る');
+
+    -- 統合すると旧URLが統合先に向く（粒度を粗くしたときの挙動）
+    PERFORM merge_spot_identity(v_other, v_identity, v_grain);
+
+    PERFORM assert_eq(
+        (SELECT status FROM spot_identity WHERE id = v_other),
+        'merged'::spot_identity_status, '統合元は merged になる');
+
+    PERFORM assert_eq(
+        resolve_spot_slug((SELECT alias_value FROM spot_alias
+                            WHERE identity_id = v_identity AND alias_kind = 'slug'
+                            ORDER BY id DESC LIMIT 1)),
+        v_identity, '統合された側の旧URLは統合先に解決する');
+
+    PERFORM assert_true(
+        (SELECT count(*) FROM spot_lineage
+          WHERE op = 'merge' AND parent_identity_id = v_other
+            AND child_identity_id = v_identity) = 1,
+        '統合が系譜に残り、称号の引き継ぎ判断ができる');
+
+    -- 統合先は公開ビューから消える（詳細ページは統合先へ 301 する想定）
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_spot_public WHERE identity_id = v_other),
+        0, '統合済みの永続IDは公開ビューに出ない');
+
+    -- 自分自身への統合は拒否される
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            PERFORM merge_spot_identity(v_identity, v_identity, v_grain);
+        EXCEPTION WHEN others THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '自分自身への統合は拒否される');
+    END;
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 14. T-05 の受け皿: 出自とライセンス条件 =='
+-- ===========================================================================
+DO $$
+BEGIN
+    PERFORM assert_true(
+        (SELECT count(*) FROM spot_source WHERE code = 'azure_maps') = 1,
+        'POI提供元が spot_source に登録されている');
+
+    -- T-05 が終わるまでライセンス条件は未確認（NULL）のままであることを明示する。
+    -- ここが NULL でなくなったら ADR が書かれたということ。
+    PERFORM assert_eq(
+        (SELECT cache_allowed FROM spot_source WHERE code = 'azure_maps'),
+        NULL::boolean, 'Azure Maps のキャッシュ可否は未確認（T-05 で埋める）');
 END;
 $$;
 
