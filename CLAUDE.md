@@ -17,6 +17,7 @@ Instagram はフォロワー数が権力になる構造で後発ユーザーが�
 | [docs/02-azure-architecture.md](docs/02-azure-architecture.md) | Azureインフラ構成。パイプライン、推論、データストア |
 | [docs/03-remaining-tasks.md](docs/03-remaining-tasks.md) | **残タスク一覧**（Notion と同じ内容） |
 | [docs/04-security-design.md](docs/04-security-design.md) | **セキュリティ設計**。要件ID（SEC-XX-nn）と受け入れ条件付き。T-03/T-04 の設計を含む |
+| [docs/05-product-decisions.md](docs/05-product-decisions.md) | **プロダクト決定の空白**（P-01〜P-08）。技術で解けない、決めるしかない論点 |
 
 設計レビュー指摘書が Notion にある（B-01〜B-12）。**未対応の指摘が残っているので、
 新しい設計判断をする前に docs/03 の Phase 0 を確認すること。**
