@@ -721,19 +721,153 @@ $$;
 
 
 -- ===========================================================================
-\echo '== 14. T-05 の受け皿: 出自とライセンス条件 =='
+\echo '== 14. T-05 POIソースのライセンス条件（ADR-001 / docs/06） =='
 -- ===========================================================================
 DO $$
+DECLARE v_ok boolean := false;
 BEGIN
-    PERFORM assert_true(
-        (SELECT count(*) FROM spot_source WHERE code = 'azure_maps') = 1,
-        'POI提供元が spot_source に登録されている');
-
-    -- T-05 が終わるまでライセンス条件は未確認（NULL）のままであることを明示する。
-    -- ここが NULL でなくなったら ADR が書かれたということ。
+    -- 完了条件その1: 外部ソースのライセンス条件が全て確認済み（NULL が残っていない）
     PERFORM assert_eq(
-        (SELECT cache_allowed FROM spot_source WHERE code = 'azure_maps'),
-        NULL::boolean, 'Azure Maps のキャッシュ可否は未確認（T-05 で埋める）');
+        (SELECT count(*)::int FROM spot_source
+          WHERE is_external
+            AND (cache_allowed IS NULL OR redistribution_allowed IS NULL OR terms_url IS NULL)
+            AND code <> 'reverse_geocode'),
+        0, '外部POIソースのライセンス条件が全て確認済みになっている');
+
+    -- 完了条件その2: MVPで使う外部ソースが1つに絞られている
+    PERFORM assert_eq(
+        (SELECT code FROM spot_source WHERE adopted AND is_external),
+        'osm', 'MVPで採用する外部POIソースは OpenStreetMap ひとつ');
+
+    PERFORM assert_eq(
+        (SELECT attribution_text FROM spot_source WHERE code = 'osm'),
+        '© OpenStreetMap contributors', 'ODbL の帰属表示文言が用意されている');
+
+    -- 採用ソースは同時に1つだけ。複数混ぜるとソース間の相互制約を踏む。
+    BEGIN
+        UPDATE spot_source SET adopted = true WHERE code = 'azure_maps';
+    EXCEPTION WHEN unique_violation THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '外部POIソースを2つ同時に採用状態にはできない');
+
+    -- Azure Maps を却下した理由が条件として残っている（再検討時の根拠）
+    PERFORM assert_eq(
+        (SELECT cache_max_age_days FROM spot_source WHERE code = 'azure_maps'),
+        180, 'Azure Maps の保持上限（6か月）が記録されている');
+
+    PERFORM assert_eq(
+        (SELECT cache_allowed FROM spot_source WHERE code = 'google_places'),
+        false, 'Google Places は place ID 以外を保存できない');
+
+    PERFORM assert_true(
+        (SELECT NOT attribution_missing FROM v_poi_license_compliance WHERE source_code = 'osm'),
+        '採用ソースに帰属表示の文言が欠けていない');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 15. spot_poi_cache の保持上限を制約で守る =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_ok    boolean := false;
+    v_purged integer;
+BEGIN
+    -- 規約上限（6か月）を超える保持期限は INSERT できない。
+    -- 運用の注意力ではなくスキーマで守る（docs/06 §4.3）。
+    BEGIN
+        INSERT INTO spot_poi_cache (cache_key, h3_index, radius_m, provider, response,
+                                    fetched_at, expires_at)
+        VALUES ('over-retention', 617700169958293503, 150, 'azure_maps', '{}'::jsonb,
+                now(), now() + interval '400 days');
+    EXCEPTION WHEN check_violation THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '6か月を超える保持期限のキャッシュ行は作れない');
+
+    -- 期限内なら入る
+    INSERT INTO spot_poi_cache (cache_key, h3_index, radius_m, provider, response,
+                                fetched_at, expires_at)
+    VALUES ('within-retention', 617700169958293503, 150, 'azure_maps', '{}'::jsonb,
+            now(), now() + interval '30 days');
+
+    -- 期限切れの掃除
+    INSERT INTO spot_poi_cache (cache_key, h3_index, radius_m, provider, response,
+                                fetched_at, expires_at)
+    VALUES ('already-expired', 617700169958293503, 150, 'azure_maps', '{}'::jsonb,
+            now() - interval '200 days', now() - interval '20 days');
+
+    PERFORM assert_eq(
+        (SELECT expired_cache_rows::int FROM v_poi_license_compliance
+          WHERE source_code = 'azure_maps'),
+        1, '保持期限を過ぎた行が監視ビューで検出される');
+
+    v_purged := purge_expired_poi_cache();
+    PERFORM assert_eq(v_purged, 1, '期限切れの応答だけが削除される');
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM spot_poi_cache WHERE cache_key = 'within-retention'),
+        1, '期限内の応答は残る');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 16. find_scenic_poi — 外部API呼び出しの置き換え =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_ver  smallint;
+    v_name text;
+    v_dir  real;
+    v_cnt  integer;
+BEGIN
+    INSERT INTO poi_extract_versions (source_code, extract_url, extract_date, is_active, note)
+    VALUES ('osm', 'https://download.geofabrik.de/asia/japan-latest.osm.pbf',
+            DATE '2026-08-01', true, 'テスト用')
+    RETURNING id INTO v_ver;
+
+    -- tourism=viewpoint。direction は「その展望台がどちらを向いているか」（docs/06 §3）
+    INSERT INTO poi_reference (extract_version_id, osm_type, osm_id, name, name_ja,
+                               category, direction_deg, location, tags)
+    VALUES (v_ver, 'node', 100001, 'Fuji Viewpoint', '富士見展望台',
+            'viewpoint', 250.0,
+            ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography,
+            '{"tourism":"viewpoint","direction":"250"}'::jsonb);
+
+    -- 名前の無いPOIは候補にしない（「この付近」と変わらないため）
+    INSERT INTO poi_reference (extract_version_id, osm_type, osm_id, name, name_ja,
+                               category, location)
+    VALUES (v_ver, 'node', 100002, NULL, NULL, 'viewpoint',
+            ST_SetSRID(ST_MakePoint(138.7275, 35.3607), 4326)::geography);
+
+    SELECT display_name, direction_deg INTO v_name, v_dir
+      FROM find_scenic_poi(35.3606, 138.7274, 150);
+
+    PERFORM assert_eq(v_name, '富士見展望台', '半径内の景観POIを日本語名で引ける');
+    PERFORM assert_eq(v_dir, 250.0::real, 'viewpoint の向きが方位セクターの事前情報として取れる');
+
+    -- 半径外は引かない
+    SELECT count(*)::int INTO v_cnt FROM find_scenic_poi(35.5000, 139.0000, 150);
+    PERFORM assert_eq(v_cnt, 0, '半径外のPOIは返さない');
+
+    -- 抽出バージョンを指定すれば、再計算で当時のデータを再現できる（docs/06 §4.2）
+    SELECT count(*)::int INTO v_cnt
+      FROM find_scenic_poi(35.3606, 138.7274, 150, (v_ver + 1)::smallint);
+    PERFORM assert_eq(v_cnt, 0, '抽出バージョンを指定すると、そのバージョンのPOIだけを見る');
+
+    -- 有効な抽出は同時に1つだけ
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            INSERT INTO poi_extract_versions (source_code, extract_url, extract_date, is_active)
+            VALUES ('osm', 'https://example.invalid/other.pbf', DATE '2026-09-01', true);
+        EXCEPTION WHEN unique_violation THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '有効な抽出バージョンは同時に1つだけ');
+    END;
 END;
 $$;
 

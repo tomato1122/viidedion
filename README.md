@@ -15,6 +15,8 @@
 | [docs/01-spot-granularity.md](docs/01-spot-granularity.md) | **スポット粒度設計** — 同定アルゴリズム、方位セクター、粒度バージョニング、再計算ジョブ |
 | [docs/02-azure-architecture.md](docs/02-azure-architecture.md) | **Azureインフラ構成** — 採点パイプライン、推論ホスティング、データストア選定、③の遅延集計 |
 | [docs/03-remaining-tasks.md](docs/03-remaining-tasks.md) | **残タスク一覧** — レビュー指摘の未対応分を含む |
+| [docs/04-security-design.md](docs/04-security-design.md) | **セキュリティ設計** — 認証、位置情報プライバシー、trust_score、投票の完全性 |
+| [docs/05-product-decisions.md](docs/05-product-decisions.md) | **未決定のプロダクト決定** — ターゲット、フィード、投票の供給、コールドスタート |
 
 ## 実装
 

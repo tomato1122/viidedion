@@ -85,6 +85,10 @@ SCENIC_CATEGORIES =
 
 一致しなければ手順6に落とす。**「無名の絶景を拾えない」問題は、POIで拾わずCELL→昇格ルートで拾う**（§1.3）。
 
+> **手順5は ADR-001 で置き換わった（§10）。** 外部POI APIは呼ばず、自前に取り込んだ
+> OSM抽出を PostGIS で近傍検索する（`find_scenic_poi()`）。SCENIC_CATEGORIES の
+> OSMタグ対応は [docs/06 §4.4](06-adr-poi-source.md)。
+
 ### 1.3 CELL → 独自スポット昇格（DBSCAN）
 
 `kind='h3_cell'` の暫定スポットは、投稿が溜まった時点で夜間バッチが精査する。
@@ -232,8 +236,8 @@ draft ──► shadow ──► active ──► deprecated ──► (archived
 recalc(grain_version_id, from_post_id, batch_size = 5000)
   1. posts を id 昇順で batch_size 件取得（カーソルは job_state に永続化）
   2. 各投稿に §1.2 の解決フローを適用 → post_spot_assignment を INSERT
-     ※ POI検索は呼ばない。再計算では spot_poi_cache から引くだけにする
-       （数十万件分の外部API課金と レート制限を避けるため）
+     ※ POI検索で外部APIは呼ばない。自前の poi_reference を読む（§10 / ADR-001）
+       当時と同じ poi_extract_version を指定すること（指定しないと結果が変わる）
   3. spot_facet_stats を集計し直す（post_count, first_post_id, last_post_at）
   4. §1.3 の DBSCAN 昇格を全セルに対して実行
   5. post_rarity_scores を再計算（②は決定的なので、同じ入力なら同じ出力）
@@ -445,3 +449,64 @@ spot_identity  ← URL・称号・訪問履歴はここを指す。粒度に依�
 - `v_post_recognition` が両者を UNION —— **APIはこのビューだけを見る。投稿1件につき必ず1行返る**
 
 `ranking_entries` に `facet_level` を足したのは、level 2 で軸を落として `weather` が NULL になった行と、天候が本当に不明だった level 1 の行が同じキーに潰れるのを防ぐため。
+
+---
+
+## 10. POIソースの確定（T-05 / ADR-001）
+
+結論と根拠は [docs/06-adr-poi-source.md](06-adr-poi-source.md)。ここでは §1〜§5 のどこが
+書き換わったかだけを示す。
+
+### 10.1 何が変わったか
+
+**MVPのPOIソースは OpenStreetMap（ODbL）。地域抽出を自前の PostGIS に取り込み、外部POI APIは呼ばない。**
+
+| 箇所 | 旧 | 新 |
+|---|---|---|
+| §1.2 手順5 | `AzureMaps.searchNearby(...)` | `find_scenic_poi(lat, lon, radius, extract_version)` |
+| §4.3 手順2 | 「再計算では `spot_poi_cache` から引く」 | 「自前の `poi_reference` を読む。当時と同じ抽出バージョンを指定する」 |
+| §5 テーブル | `spot_poi_cache`（外部応答の永続キャッシュ） | `poi_reference` / `poi_extract_versions` を追加。`spot_poi_cache` はMVPでは未使用 |
+
+### 10.2 なぜ変えたか
+
+§4.3 は「再計算では外部APIを呼ばず、キャッシュから引く」ことを前提にしていた。
+**Azure Maps の規約はこれを許していない。**
+
+- キャッシュが許されるのは *latency の低減* が目的の場合に限られる
+- 保持期間は「応答ヘッダの有効期間」か「6か月」の短いほう
+- 「scaling such Results to serve multiple users」目的のキャッシュは明示的に禁止
+
+再計算のために応答を溜めておく行為は、目的が課金とレート制限の回避なので、
+どう読んでも latency 低減ではない。**粒度バージョニングは「いつでも全件再計算できる」ことに
+全体が乗っているので、ここが制約されると設計の根幹が崩れる。**
+
+OSM を自前に取り込めば、それは自分のデータベースなので保持期間の制約が無く、
+再計算で何度読んでも課金されない。**§4.3 がそのまま生き残る唯一の選択肢だった。**
+
+### 10.3 新しく増えた再現性の問題
+
+抽出を更新すると POI が増減し、同じ投稿から違うスポットが出る。
+**粒度バージョンとまったく同じ再現性の問題**なので、同じようにバージョンを切った。
+
+```
+poi_extract_versions.is_active が指す1本だけを新規投稿に使う
+再計算は「その投稿を最初に処理したときの抽出バージョン」を指定する
+```
+
+抽出の更新は全件再計算を伴うため、**粒度バージョンの切り替えと同時に行うのが筋**。
+更新頻度は T-21 で確定する。
+
+### 10.4 副次的に得たもの
+
+`tourism=viewpoint` には `direction=*`（その展望台がどちらを向いているか）が付くことがある。
+`poi_reference.direction_deg` に取り込んである。§2 の方位セクターと §2.3 の
+`bearing_split_enabled` の**事前情報**として使える。商用POI APIでは得られない情報。
+
+### 10.5 引き受けた義務
+
+- **帰属表示**: 「© OpenStreetMap contributors」を常時表示し、openstreetmap.org/copyright へリンクする
+- **シェアアライク**: `poi_reference` は OSM の派生データベース。ODbL で公開できる状態にしておく。
+  **及ぶのは OSM 由来のデータだけで、ユーザーの投稿・写真・スコアには及ばない**
+
+`spots.source_code` で出自を判別できるようにしてあるのは、この分離のため。
+遵守状態は `v_poi_license_compliance` で監視する。
