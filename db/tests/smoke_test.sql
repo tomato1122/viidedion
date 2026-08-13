@@ -1417,6 +1417,59 @@ END;
 $$;
 
 
+-- ===========================================================================
+\echo '== 25. T-21 再計算のガードと進捗 =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_active smallint := (SELECT id FROM spot_grain_versions WHERE status = 'active');
+    v_draft  smallint;
+    v_ok     boolean := false;
+BEGIN
+    -- 配信中のバージョンを作り直させない（docs/01 §4.2 の Blue-Green を強制する）
+    BEGIN
+        INSERT INTO grain_recalc_runs (grain_version_id) VALUES (v_active);
+    EXCEPTION WHEN raise_exception THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '配信中の粒度バージョンに対して再計算を開始できない');
+
+    INSERT INTO spot_grain_versions (
+        code, status, h3_resolution, snap_radius_m, poi_match_radius_m,
+        bearing_sector_count, dbscan_eps_m, dbscan_min_points, dbscan_min_users,
+        gps_accuracy_reject_m
+    ) VALUES ('g-recalc-target', 'draft', 11, 20, 150, 8, 50, 5, 3, 100)
+    RETURNING id INTO v_draft;
+
+    INSERT INTO grain_recalc_runs (grain_version_id) VALUES (v_draft);
+    PERFORM assert_eq(
+        (SELECT phase FROM grain_recalc_runs WHERE grain_version_id = v_draft),
+        'assign'::recalc_phase, 'draft に対しては再計算を開始でき、assign から始まる');
+
+    -- 未完了のランは粒度バージョンごとに1本まで（多重起動で二重に走らせない）
+    v_ok := false;
+    BEGIN
+        INSERT INTO grain_recalc_runs (grain_version_id) VALUES (v_draft);
+    EXCEPTION WHEN unique_violation THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '未完了の再計算は粒度バージョンごとに1本まで');
+
+    PERFORM assert_true(
+        (SELECT count(*) FROM v_recalc_progress WHERE completed_at IS NULL) = 1,
+        '進捗ビューで走っている再計算が見える');
+
+    -- 完了させれば同じバージョンに次のランを立てられる
+    UPDATE grain_recalc_runs SET phase = 'done', completed_at = now()
+     WHERE grain_version_id = v_draft;
+    INSERT INTO grain_recalc_runs (grain_version_id) VALUES (v_draft);
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM grain_recalc_runs WHERE grain_version_id = v_draft),
+        2, '完了した後なら再計算をやり直せる');
+END;
+$$;
+
+
 \echo ''
 \echo 'ALL SMOKE TESTS PASSED'
 ROLLBACK;

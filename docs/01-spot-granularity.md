@@ -265,16 +265,29 @@ draft ──► shadow ──► active ──► deprecated ──► (archived
 ### 4.3 再計算ジョブ
 
 ```
-recalc(grain_version_id, from_post_id, batch_size = 5000)
-  1. posts を id 昇順で batch_size 件取得（カーソルは job_state に永続化）
-  2. 各投稿に §1.2 の解決フローを適用 → post_spot_assignment を INSERT
-     ※ POI検索で外部APIは呼ばない。自前の poi_reference を読む（§10 / ADR-001）
-       当時と同じ poi_extract_version を指定すること（指定しないと結果が変わる）
-  3. spot_facet_stats を集計し直す（post_count, first_post_id, last_post_at）
-  4. §1.3 の DBSCAN 昇格を全セルに対して実行
-  5. post_rarity_scores を再計算（②は決定的なので、同じ入力なら同じ出力）
-  6. ranking_entries を再生成
+recalc(grain_version_id)          -- 実装: core/recalc.py / jobs/recalc_grain.py
+
+  assign  : posts を id 昇順でバッチ処理し、§1.2 の解決フローを適用
+            → post_spot_assignment。カーソルは grain_recalc_runs に永続化
+            ※ POI検索で外部APIは呼ばない。自前の poi_reference を読む（§10 / ADR-001）
+              ランの開始時点の poi_extract_version を焼き付ける
+  promote : §1.3 の DBSCAN 昇格を全セルに対して実行
+  lineage : split を確定させる（§8.3）。**全件揃わないと判定できない**
+  rarity  : spot_facet_stats を作り直しながら post_rarity_scores を再計算
+  ranking : ranking_entries を再生成
 ```
+
+**フェーズの順序に意味がある。**
+
+- `promote` は紐付けを張り替えるので、必ず `rarity` より前。逆にすると張り替え前の
+  スポットで計算した②が残る
+- `lineage` と `rarity` を assign から分けてあるのは、split は投稿の分布を、
+  「初」判定は撮影時刻順の逐次処理を必要とし、**どちらも1件ずつの処理では確定できない**ため
+
+**対象は draft / shadow のみ。** 配信中のバージョンを作り直す操作は
+`grain_recalc_runs` のトリガで拒否する（§4.2 の Blue-Green を強制するため）。
+ただし `rarity` だけは配信中にも当てられる —— DBSCAN昇格（§1.3）が紐付けを
+張り替えた後の②を直す経路で、スポットは動かさないため。
 
 **冪等性が要件**。ジョブは途中で落ちる前提で、`ON CONFLICT (post_id, grain_version_id) DO UPDATE` と カーソル永続化で再開可能にする。
 
@@ -307,6 +320,7 @@ DDL全文は [`db/migrations/`](../db/migrations/)。ここでは意図だけ記
 | `spot_source` | 出自とライセンス条件（T-05 の置き場） | なし |
 | `spots` | スポット実体（kind, centroid, h3_index, display_name） | **あり** |
 | `ranking_facet_levels` | ランキングの粗さの階段の定義。§9 | なし |
+| `grain_recalc_runs` | 再計算のフェーズとカーソル。§4.3 | **あり** |
 | `post_discovery_labels` | 順位が付かなかった投稿の発見表現。§9 | **あり** |
 | `post_spot_assignment` | 投稿↔スポット + ファセットキー | **あり（I-2）** |
 | `spot_facet_stats` | ファセット別の累計・初回投稿 | **あり** |
@@ -427,6 +441,8 @@ URLと称号が切れる。`post_spot_assignment` を引けば厳密に決まる
 距離判定は投稿の文脈が無い経路のフォールバックとして残してある。
 
 `merge` された側の `slug` は `spot_alias` に移り、`resolve_spot_slug()` が統合先まで辿る。**旧URLは 301 で生き続ける。**
+
+**親を引き継げるのは1つの実体だけ。** 同一粒度では `spots (grain_version_id, identity_id)` が一意なので、同じ親を2つの実体が引き継ごうとすると、後から来た方が `upsert_spot_with_identity` の `ON CONFLICT` に当たり、**離れた2地点が黙って1つのスポットに潰れて重心が動く**。実装（`core/spots.py` の `_claim_identity`）は、親が既に引き継がれていたら新しい identity を発行して `split` として記録する。**粒度を細かくする再計算でしか出ないので、通常の取り込みでは気づけない。**
 
 ### 8.4 称号の連続性
 

@@ -111,7 +111,7 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 
 ```
 docs/          設計ドキュメント（日本語）
-db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0013、連番・追記のみ）
+db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0014、連番・追記のみ）
 db/tests/      スキーマと関数のスモークテスト
 scoring/       ファセット導出規則（標準ライブラリのみ）
 core/          デプロイ単位が共有するドメイン層（h3-py + psycopg）
@@ -161,6 +161,7 @@ PostgreSQL のテストには **PostGIS 拡張が使えるサーバー**が必�
 | **ランキング再生成は一時テーブルを使わない** | plpgsql のプランキャッシュが消えた一時テーブルを掴む。進捗は `ranking_entries` 自体を見て判定する |
 | **POIは OSM 抽出を自前に取り込む（外部POI APIを呼ばない）** | Azure Maps は再計算目的の永続キャッシュを禁じている。自前データなら保持期限も課金も無い（ADR-001 / docs/06） |
 | **DBSCAN の近傍判定は PostGIS の `ST_DWithin`** | 球面近似ではなく測地線距離になり GiST索引も効く。numpy / scikit-learn を入れずに済む（docs/01 §1.3） |
+| **同一粒度で親 identity を引き継げる実体は1つだけ** | 2つ目は新しい identity を発行して `split` にする。確かめずに親を渡すと `ON CONFLICT` で離れた2地点が1スポットに潰れる（docs/01 §8.3） |
 | **系譜（carry_over）の判定は距離より `post_spot_assignment` を優先** | 暫定セルスポットの重心はグリッド由来で、解像度が変わると同じ場所でも100m近くずれる。距離だけで判定すると identity を作り直してURLと称号が切れる（docs/01 §8.3） |
 
 ### H3の解像度別統計は v4 の値を使う

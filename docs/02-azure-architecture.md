@@ -324,10 +324,11 @@ MVPの構成目標は **固定費をPostgreSQLと採点ワーカーの2つだけ
 | ingest（EXIF・pHash・サムネ） | `ingest/` | — | **未着手（T-13）** |
 | 採点ワーカー ①AI | `worker/` | — | **未着手（T-14）**。特徴量検証 T-07 / T-08 待ち |
 | 採点ワーカー スポット解決 | `worker/` | `core/spots.py` | ✅ 実装済み（T-15） |
-| 採点ワーカー ②希少性 | `worker/` | `calc_rarity_score`（SQL） | 関数は実装済み。呼び出し側が未着手 |
+| 採点ワーカー ②希少性 | `worker/` | `calc_rarity_score`（SQL） | 関数は実装済み。投稿1件ごとの呼び出しは T-13。一括計算は T-21 で実装済み |
 | finalizer（③確定スイープ） | Functions or pg_cron | `calc_community_score`（SQL） | 関数は実装済み。スイープの起動は T-18 |
 | DBSCAN昇格バッチ | `jobs/` | `core/clusters.py` | ✅ 実装済み（T-16） |
-| 粒度再計算ジョブ | `jobs/` | — | **未着手（T-21）** |
+| ②希少性の一括計算 | `jobs/` | `recompute_rarity_for_grain`（SQL） | ✅ 実装済み（T-21） |
+| 粒度再計算ジョブ | `jobs/` | `core/recalc.py` | ✅ 実装済み（T-21） |
 | ランキング再生成 | pg_cron | `rebuild_ranking_entries`（SQL） | ✅ 実装済み |
 
 ### デプロイ単位の分け方

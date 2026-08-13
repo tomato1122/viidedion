@@ -135,6 +135,51 @@ def find_parent_identity(
     return candidates[0][0], "merge"
 
 
+def _claim_identity(
+    cur: psycopg.Cursor, grain, parent_identity: UUID | None, lineage_op: str
+) -> tuple[UUID | None, str, UUID | None]:
+    """親 identity を引き継げるか確かめる。返り値は (使う identity, 操作, 分割元)。
+
+    同一粒度では identity ごとに実体は1つしか持てない（`spots_identity_uix`）。
+    **親が既に別の実体に引き継がれていたら、それは分割**なので、この実体には
+    新しい identity を発行しなければならない。
+
+    確かめずに親を渡すと `upsert_spot_with_identity` の
+    `ON CONFLICT (grain_version_id, identity_id) DO UPDATE` が働いて、
+    **離れた2地点が黙って1つのスポットに潰れ、重心が後から来た方に動く**。
+    粒度を細かくする再計算（1スポットが2つに割れる場面）でしか出ないので、
+    通常の取り込みでは気づけない。
+    """
+    if parent_identity is None:
+        return None, "create", None
+
+    cur.execute(
+        "SELECT 1 FROM spots WHERE grain_version_id = %s AND identity_id = %s",
+        (grain.id, parent_identity),
+    )
+    if cur.fetchone() is None:
+        return parent_identity, lineage_op, None
+
+    return None, "create", parent_identity
+
+
+def _record_split(cur: psycopg.Cursor, grain, parent_identity: UUID, child_identity: UUID) -> None:
+    """分割で新しく発行した identity に、どの親から割れたかを残す。
+
+    `upsert_spot_with_identity` が書いた 'create' の行を上書きする。
+    投稿の配分（`post_share`）は全件処理が終わらないと出せないので、
+    ここでは親子関係だけ記録し、再計算の lineage フェーズ（T-21）が確定させる。
+    """
+    cur.execute(
+        """
+        UPDATE spot_lineage
+           SET op = 'split', parent_identity_id = %s
+         WHERE to_grain_version_id = %s AND child_identity_id = %s AND op = 'create'
+        """,
+        (parent_identity, grain.id, child_identity),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 解決フロー（docs/01 §1.2）
 # ---------------------------------------------------------------------------
@@ -210,6 +255,9 @@ def _match_poi(
     parent_identity, lineage_op = find_parent_identity(
         cur, grain.id, lat, lon, grain.snap_radius_m, post_id
     )
+    parent_identity, lineage_op, split_parent = _claim_identity(
+        cur, grain, parent_identity, lineage_op
+    )
 
     cur.execute(
         """
@@ -228,6 +276,8 @@ def _match_poi(
         "SELECT identity_id, h3_index, bearing_split_enabled FROM spots WHERE id = %s", (spot_id,)
     )
     identity_id, h3_index, split_enabled = cur.fetchone()
+    if split_parent is not None:
+        _record_split(cur, grain, split_parent, identity_id)
     return SpotBinding(spot_id, identity_id, h3_index, "poi", None, split_enabled)
 
 
@@ -257,6 +307,9 @@ def _cell(
     parent_identity, lineage_op = find_parent_identity(
         cur, grain.id, lat, lon, grain.snap_radius_m, post_id
     )
+    parent_identity, lineage_op, split_parent = _claim_identity(
+        cur, grain, parent_identity, lineage_op
+    )
 
     cur.execute(
         """
@@ -275,6 +328,8 @@ def _cell(
         "SELECT identity_id, h3_index, bearing_split_enabled FROM spots WHERE id = %s", (spot_id,)
     )
     identity_id, h3_index, split_enabled = cur.fetchone()
+    if split_parent is not None:
+        _record_split(cur, grain, split_parent, identity_id)
     return SpotBinding(spot_id, identity_id, h3_index, "cell", None, split_enabled)
 
 
