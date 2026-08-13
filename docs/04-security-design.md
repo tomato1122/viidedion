@@ -476,15 +476,25 @@ CREATE TABLE post_trust_scores (
 
 実装を引き継ぐ際は、この順で着手すること。各項目は独立して PR にできる。
 
-1. **SEC-TRUST-03 のマイグレーション**（trust_rulesets / post_trust_scores / user_privacy_zones /
-   location_blocklist）。既存マイグレーションの流儀（0001〜0007）に合わせ、
-   `db/tests/smoke_test.sql` にアサーションを追加する
+1. ~~**SEC-TRUST-03 のマイグレーション**（trust_rulesets / post_trust_scores /
+   user_privacy_zones / location_blocklist）~~ **✅ 完了（`0011_trust_and_privacy.sql`）**
+   - `calc_trust_score()` が閾値の適用まで行う（閾値も `trust_rulesets` に入れた）
+   - `trust_penalty_mult()` / `trust_first_bonus_eligible()` が帯域を既存の
+     `calc_rarity_score(p_penalty_mult)` / `record_facet_post(p_eligible)` に橋渡しする
+   - `resolve_location_privacy()` がユーザー選択・ゾーン・ブロックリストの
+     **最も厳しいもの**を返す。`reapply_privacy_zones()` が遡及適用する
+   - **SEC-PRIV-02 の実装は仕様から一段強めた。** 投稿に表示座標を持たせず、
+     `h3_cell_centers`（セルごとに1行）を引く形にしたので、
+     **投稿ごとにジッターを入れる場所が構造として存在しない**
+   - 座標を返してよいのは `v_post_location_public` だけ
 2. **SEC-PRIV-01 の CI テスト**（EXIF除去検証）。ingest 実装（T-13）より先に
    テストだけ書いておく（実装がテストを追う形にする）
 3. **SEC-AUTH-02 のトークン検証ミドルウェア**（API 実装 T-19 の最初のコミット）
 4. **SEC-API-02 のレート制限**（T-19 内）
 5. **SEC-VOTE-01 のペアトークン**（T-19 内）
-6. **SEC-TRUST-01/02 の判定関数**（T-13 内。`post_integrity_checks` → 合成 → 帯域）
+6. **SEC-TRUST-01/02 の呼び出し**（T-13 内）。判定関数そのものは 1 で実装済み。
+   残るのは `post_integrity_checks` の生値を `calc_trust_score()` の入力 jsonb に
+   組み立てる部分と、`device_attestation` の有効化（T-20 のクライアント実装後）
 7. IaC を書く際に §3 のフラグ群を最初から入れる（後付けは事故る）
 
 各PRは対応する SEC-ID を本文に記載し、受け入れ条件のテストを含めること。

@@ -61,22 +61,32 @@ SELECT 'user' || i, 'テストユーザー' || i FROM generate_series(1, 8) i;
 INSERT INTO t_ids
 SELECT 'spot_a', gen_random_uuid();
 
--- 富士山周辺を想定したダミー座標（H3インデックスは本来アプリ層で計算する）
-INSERT INTO spots (id, grain_version_id, kind, h3_index, centroid,
-                   display_name, name_source, poi_source, poi_external_id)
+-- 富士山周辺を想定したダミー座標（H3インデックスは本来アプリ層で計算する）。
+-- スポットは粒度バージョンごとの「実体」なので、先に永続ID（spot_identity）を発行する（T-01）。
+INSERT INTO spot_identity (slug, canonical_name, name_source, source_code, representative_point)
+VALUES ('tenbodai-a', '◯◯展望台', 'poi', 'azure_maps',
+        ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography);
+
+INSERT INTO t_ids
+SELECT 'identity_a', id FROM spot_identity WHERE slug = 'tenbodai-a';
+
+INSERT INTO spots (id, identity_id, grain_version_id, kind, h3_index, centroid,
+                   display_name, name_source, poi_source, source_code, poi_external_id)
 SELECT (SELECT v FROM t_ids WHERE k = 'spot_a'),
+       (SELECT v FROM t_ids WHERE k = 'identity_a'),
        (SELECT v FROM t_grain WHERE k = 'grain'),
        'poi', 617700169958293503,
        ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography,
-       '◯◯展望台', 'poi', 'azure_maps', 'poi-test-0001';
+       '◯◯展望台', 'poi', 'azure_maps', 'azure_maps', 'poi-test-0001';
 
 -- kind='poi' なのに出自が無いスポットは作れない
 DO $$
 DECLARE v_ok boolean := false;
 BEGIN
     BEGIN
-        INSERT INTO spots (grain_version_id, kind, h3_index, centroid)
-        VALUES ((SELECT v FROM t_grain WHERE k = 'grain'), 'poi', 617700169958293504,
+        INSERT INTO spots (identity_id, grain_version_id, kind, h3_index, centroid)
+        VALUES ((SELECT v FROM t_ids WHERE k = 'identity_a'),
+                (SELECT v FROM t_grain WHERE k = 'grain'), 'poi', 617700169958293504,
                 ST_SetSRID(ST_MakePoint(138.72, 35.36), 4326)::geography);
     EXCEPTION WHEN check_violation THEN
         v_ok := true;
@@ -329,10 +339,12 @@ DECLARE
     v_ruleset smallint := (SELECT id FROM scoring_rulesets WHERE is_active);
     i        integer;
 BEGIN
-    -- 同一ファセットに6件（足切り5件を超える）を作る
+    -- 同一ファセットに6件（足切り5件を超える）を作る。
+    -- 投稿者は3人に散らす。1人の連投ではランキングを成立させない（T-02 / B-03）ため、
+    -- 全件を同一ユーザーにするとこのファセットは発見表現へ落ちる。
     FOR i IN 1..6 LOOP
         INSERT INTO posts (author_id, status, captured_at, posted_at, weather, timeslot, season)
-        VALUES ((SELECT id FROM users WHERE handle = 'user7'), 'published',
+        VALUES ((SELECT id FROM users WHERE handle = 'user' || (1 + i % 3)), 'published',
                 now(), now(), 'clear', 'golden', 'summer')
         RETURNING id INTO v_post;
 
@@ -405,6 +417,105 @@ BEGIN
           WHERE table_name = 'v_post_display'
             AND column_name IN ('total_score', 'ai_score', 'rarity_score', 'community_score')),
         0, '公開ビューは生の合計点を一切含まない（docs/00 §3 変更禁止）');
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_name = 'v_post_recognition'
+            AND column_name IN ('total_score', 'ai_score', 'rarity_score', 'community_score')),
+        0, '統合ビューも生の合計点を一切含まない');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 9b. T-02 フォールバック階段と発見表現 =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_grain  smallint := (SELECT v FROM t_grain WHERE k = 'grain');
+    v_spot   uuid     := (SELECT v FROM t_ids   WHERE k = 'spot_a');
+    v_period integer  := (SELECT id FROM ranking_periods
+                           WHERE kind = 'weekly' ORDER BY starts_at DESC LIMIT 1);
+    v_post   uuid;
+    i        integer;
+    v_rows   integer;
+BEGIN
+    -- 母数2件の fog ファセットは、どの段まで落ちても成立しない → 発見表現へ
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM post_discovery_labels
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        2, 'どの段でも成立しないファセットの投稿は発見表現に落ちる');
+
+    PERFORM assert_eq(
+        (SELECT DISTINCT kind FROM post_discovery_labels
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        'new_scenery'::discovery_kind, '累計投稿の少ないスポットは「新しい景色」として出す');
+
+    -- 完了条件: 順位を出すか発見表現にするかが投稿ごとに一意に決まる
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_post_recognition
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        8, '期間内の全投稿がちょうど1行ずつ統合ビューに出る');
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM (
+            SELECT post_id FROM v_post_recognition
+             WHERE period_id = v_period AND grain_version_id = v_grain
+             GROUP BY post_id HAVING count(*) > 1
+         ) dup),
+        0, '順位と発見表現が同じ投稿に二重に付くことはない');
+
+    -- 1人の連投ではランキングを成立させない（B-03）
+    -- 同一ユーザーだけで7件を別ファセットに積んでも、投稿者数の下限3人に届かない
+    FOR i IN 1..7 LOOP
+        INSERT INTO posts (author_id, status, captured_at, posted_at, weather, timeslot, season)
+        VALUES ((SELECT id FROM users WHERE handle = 'user8'), 'published',
+                now(), now(), 'rain', 'dusk', 'summer')
+        RETURNING id INTO v_post;
+
+        INSERT INTO post_spot_assignment (post_id, grain_version_id, spot_id, h3_index,
+                                          bearing_sector, bind_method)
+        VALUES (v_post, v_grain, v_spot, 617700169958293503, 3, 'poi');
+
+        INSERT INTO post_ai_scores (post_id, model_bundle_version, ai_score)
+        VALUES (v_post, 'test-v1', 20 + i);
+    END LOOP;
+
+    v_rows := rebuild_ranking_entries(v_period, v_grain);
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM ranking_entries
+          WHERE period_id = v_period AND grain_version_id = v_grain AND weather = 'rain'),
+        0, '投稿数を満たしても投稿者が1人ならランキングは成立しない');
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM post_discovery_labels
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        9, '連投で弾かれた投稿も発見表現で受け止める');
+
+    -- 階段の段数が記録され、粗い段に落ちたことが後から分かる
+    PERFORM assert_eq(
+        (SELECT DISTINCT facet_level FROM ranking_entries
+          WHERE period_id = v_period AND grain_version_id = v_grain),
+        1::smallint, '最も細かい段で成立したファセットは level=1 で記録される');
+
+    -- 同一投稿に2つの順位を持たせない（T-02 の完了条件を制約で守る）
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            INSERT INTO ranking_entries (
+                period_id, grain_version_id, spot_id, spot_identity_id, facet_level,
+                post_id, rank, facet_post_count, top_percentile, total_score
+            )
+            SELECT period_id, grain_version_id, spot_id, spot_identity_id, 3,
+                   post_id, 1, 9, 0.1, 50
+              FROM ranking_entries
+             WHERE period_id = v_period AND grain_version_id = v_grain LIMIT 1;
+        EXCEPTION WHEN unique_violation THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '1投稿に対して順位は1つしか持てない');
+    END;
 END;
 $$;
 
@@ -427,8 +538,11 @@ BEGIN
     ) VALUES ('g2-h3r10-sector8', 'shadow', 10, 60, 150, 8, 50, 5, 3, 100)
     RETURNING id INTO v_new;
 
-    INSERT INTO spots (id, grain_version_id, kind, h3_index, centroid)
-    VALUES (v_spot_new, v_new, 'h3_cell', 622700169958293503,
+    -- 新しい粒度バージョンでも同じ場所は同じ永続IDを引き継ぐ。
+    -- これが T-01 の要点で、引き継がないとURLと称号が切れる。
+    INSERT INTO spots (id, identity_id, grain_version_id, kind, h3_index, centroid)
+    VALUES (v_spot_new, (SELECT v FROM t_ids WHERE k = 'identity_a'),
+            v_new, 'h3_cell', 622700169958293503,
             ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography);
 
     -- 同じ投稿が新旧2つのバージョンに同時に紐づく（不変条件 I-2）
@@ -471,6 +585,531 @@ DECLARE v_cnt int;
 BEGIN
     SELECT count(*)::int INTO v_cnt FROM v_grain_health;
     PERFORM assert_true(v_cnt >= 2, 'v_grain_health が全バージョンぶん集計される');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 12. T-01 永続IDは粒度変更をまたいで生き残る =='
+-- ===========================================================================
+-- ここに到達した時点で、section 10 が active を g1 → g2 に差し替えている。
+-- 「粒度を変更しても、スポットのURLと称号履歴が維持される」が T-01 の完了条件。
+DO $$
+DECLARE
+    v_identity uuid := (SELECT v FROM t_ids WHERE k = 'identity_a');
+BEGIN
+    PERFORM assert_eq(
+        (SELECT code FROM spot_grain_versions WHERE status = 'active'),
+        'g2-h3r10-sector8', '前提: 粒度は g2 に切り替わっている');
+
+    -- URL
+    PERFORM assert_eq(resolve_spot_slug('tenbodai-a'), v_identity,
+        '粒度を切り替えてもスポットのURLは同じ identity に解決する');
+
+    -- 称号履歴（旧粒度で取った1位が残っている）
+    PERFORM assert_true(
+        (SELECT count(*) FROM v_spot_titles WHERE spot_identity_id = v_identity) > 0,
+        '粒度を切り替えても過去の称号が残る');
+
+    PERFORM assert_eq(
+        (SELECT DISTINCT rank FROM v_spot_titles WHERE spot_identity_id = v_identity),
+        1, '称号ビューは1位だけを返す（下位順位を漏らさない）');
+
+    -- スポット詳細ページは新しい粒度の実体を見る
+    PERFORM assert_eq(
+        (SELECT grain_version_id FROM v_spot_public WHERE identity_id = v_identity),
+        (SELECT id FROM spot_grain_versions WHERE status = 'active'),
+        'スポット詳細は常にアクティブな粒度の実体を返す');
+
+    PERFORM assert_eq(
+        (SELECT display_name FROM v_spot_public WHERE identity_id = v_identity),
+        '◯◯展望台', '新しい粒度の実体が未命名でも、永続IDの名前が表示に残る');
+
+    -- 同一粒度に同じ identity の実体は1つだけ
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            INSERT INTO spots (identity_id, grain_version_id, kind, h3_index, centroid)
+            VALUES (v_identity, (SELECT id FROM spot_grain_versions WHERE status = 'active'),
+                    'h3_cell', 622700169958293999,
+                    ST_SetSRID(ST_MakePoint(138.73, 35.36), 4326)::geography);
+        EXCEPTION WHEN unique_violation THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '1つの粒度バージョンに同じ永続IDの実体は1つしか作れない');
+    END;
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 13. T-01 改名・統合・系譜 =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_identity uuid := (SELECT v FROM t_ids WHERE k = 'identity_a');
+    v_grain    smallint := (SELECT id FROM spot_grain_versions WHERE status = 'active');
+    v_other    uuid;
+    v_spot     uuid;
+BEGIN
+    -- 改名しても旧名で辿れる
+    PERFORM rename_spot_identity(v_identity, '△△パノラマ台', 'user');
+    PERFORM assert_eq(
+        (SELECT canonical_name FROM spot_identity WHERE id = v_identity),
+        '△△パノラマ台', '命名が採用されると表示名が変わる');
+    PERFORM assert_true(
+        (SELECT count(*) FROM spot_alias
+          WHERE identity_id = v_identity AND alias_kind = 'display_name'
+            AND alias_value = '◯◯展望台') = 1,
+        '旧名は alias に退避され、検索から消えない');
+
+    -- 日本語名は URL に使えないので座標を種にする
+    PERFORM assert_true(
+        generate_spot_slug('◯◯展望台',
+            ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography) ~ '^spot-',
+        'ASCIIに落ちない表示名のときは座標由来の slug を作る');
+
+    -- 新しいスポットを親付きで作ると系譜が繋がる
+    v_spot := upsert_spot_with_identity(
+        v_grain, 'cluster', 622700169958294111,
+        ST_SetSRID(ST_MakePoint(138.7280, 35.3610), 4326)::geography,
+        'テスト昇格スポット', 'user', 'user', NULL, NULL, 'create');
+
+    SELECT identity_id INTO v_other FROM spots WHERE id = v_spot;
+    PERFORM assert_true(v_other IS DISTINCT FROM v_identity,
+        '親を指定しなければ新しい永続IDが発行される');
+    PERFORM assert_eq(
+        (SELECT op FROM spot_lineage WHERE child_identity_id = v_other),
+        'create'::spot_lineage_op, '新規スポットは系譜に create として残る');
+
+    -- 統合すると旧URLが統合先に向く（粒度を粗くしたときの挙動）
+    PERFORM merge_spot_identity(v_other, v_identity, v_grain);
+
+    PERFORM assert_eq(
+        (SELECT status FROM spot_identity WHERE id = v_other),
+        'merged'::spot_identity_status, '統合元は merged になる');
+
+    PERFORM assert_eq(
+        resolve_spot_slug((SELECT alias_value FROM spot_alias
+                            WHERE identity_id = v_identity AND alias_kind = 'slug'
+                            ORDER BY id DESC LIMIT 1)),
+        v_identity, '統合された側の旧URLは統合先に解決する');
+
+    PERFORM assert_true(
+        (SELECT count(*) FROM spot_lineage
+          WHERE op = 'merge' AND parent_identity_id = v_other
+            AND child_identity_id = v_identity) = 1,
+        '統合が系譜に残り、称号の引き継ぎ判断ができる');
+
+    -- 統合先は公開ビューから消える（詳細ページは統合先へ 301 する想定）
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_spot_public WHERE identity_id = v_other),
+        0, '統合済みの永続IDは公開ビューに出ない');
+
+    -- 自分自身への統合は拒否される
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            PERFORM merge_spot_identity(v_identity, v_identity, v_grain);
+        EXCEPTION WHEN others THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '自分自身への統合は拒否される');
+    END;
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 14. T-05 POIソースのライセンス条件（ADR-001 / docs/06） =='
+-- ===========================================================================
+DO $$
+DECLARE v_ok boolean := false;
+BEGIN
+    -- 完了条件その1: 外部ソースのライセンス条件が全て確認済み（NULL が残っていない）
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM spot_source
+          WHERE is_external
+            AND (cache_allowed IS NULL OR redistribution_allowed IS NULL OR terms_url IS NULL)
+            AND code <> 'reverse_geocode'),
+        0, '外部POIソースのライセンス条件が全て確認済みになっている');
+
+    -- 完了条件その2: MVPで使う外部ソースが1つに絞られている
+    PERFORM assert_eq(
+        (SELECT code FROM spot_source WHERE adopted AND is_external),
+        'osm', 'MVPで採用する外部POIソースは OpenStreetMap ひとつ');
+
+    PERFORM assert_eq(
+        (SELECT attribution_text FROM spot_source WHERE code = 'osm'),
+        '© OpenStreetMap contributors', 'ODbL の帰属表示文言が用意されている');
+
+    -- 採用ソースは同時に1つだけ。複数混ぜるとソース間の相互制約を踏む。
+    BEGIN
+        UPDATE spot_source SET adopted = true WHERE code = 'azure_maps';
+    EXCEPTION WHEN unique_violation THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '外部POIソースを2つ同時に採用状態にはできない');
+
+    -- Azure Maps を却下した理由が条件として残っている（再検討時の根拠）
+    PERFORM assert_eq(
+        (SELECT cache_max_age_days FROM spot_source WHERE code = 'azure_maps'),
+        180, 'Azure Maps の保持上限（6か月）が記録されている');
+
+    PERFORM assert_eq(
+        (SELECT cache_allowed FROM spot_source WHERE code = 'google_places'),
+        false, 'Google Places は place ID 以外を保存できない');
+
+    PERFORM assert_true(
+        (SELECT NOT attribution_missing FROM v_poi_license_compliance WHERE source_code = 'osm'),
+        '採用ソースに帰属表示の文言が欠けていない');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 15. spot_poi_cache の保持上限を制約で守る =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_ok    boolean := false;
+    v_purged integer;
+BEGIN
+    -- 規約上限（6か月）を超える保持期限は INSERT できない。
+    -- 運用の注意力ではなくスキーマで守る（docs/06 §4.3）。
+    BEGIN
+        INSERT INTO spot_poi_cache (cache_key, h3_index, radius_m, provider, response,
+                                    fetched_at, expires_at)
+        VALUES ('over-retention', 617700169958293503, 150, 'azure_maps', '{}'::jsonb,
+                now(), now() + interval '400 days');
+    EXCEPTION WHEN check_violation THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '6か月を超える保持期限のキャッシュ行は作れない');
+
+    -- 期限内なら入る
+    INSERT INTO spot_poi_cache (cache_key, h3_index, radius_m, provider, response,
+                                fetched_at, expires_at)
+    VALUES ('within-retention', 617700169958293503, 150, 'azure_maps', '{}'::jsonb,
+            now(), now() + interval '30 days');
+
+    -- 期限切れの掃除
+    INSERT INTO spot_poi_cache (cache_key, h3_index, radius_m, provider, response,
+                                fetched_at, expires_at)
+    VALUES ('already-expired', 617700169958293503, 150, 'azure_maps', '{}'::jsonb,
+            now() - interval '200 days', now() - interval '20 days');
+
+    PERFORM assert_eq(
+        (SELECT expired_cache_rows::int FROM v_poi_license_compliance
+          WHERE source_code = 'azure_maps'),
+        1, '保持期限を過ぎた行が監視ビューで検出される');
+
+    v_purged := purge_expired_poi_cache();
+    PERFORM assert_eq(v_purged, 1, '期限切れの応答だけが削除される');
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM spot_poi_cache WHERE cache_key = 'within-retention'),
+        1, '期限内の応答は残る');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 16. find_scenic_poi — 外部API呼び出しの置き換え =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_ver  smallint;
+    v_name text;
+    v_dir  real;
+    v_cnt  integer;
+BEGIN
+    INSERT INTO poi_extract_versions (source_code, extract_url, extract_date, is_active, note)
+    VALUES ('osm', 'https://download.geofabrik.de/asia/japan-latest.osm.pbf',
+            DATE '2026-08-01', true, 'テスト用')
+    RETURNING id INTO v_ver;
+
+    -- tourism=viewpoint。direction は「その展望台がどちらを向いているか」（docs/06 §3）
+    INSERT INTO poi_reference (extract_version_id, osm_type, osm_id, name, name_ja,
+                               category, direction_deg, location, tags)
+    VALUES (v_ver, 'node', 100001, 'Fuji Viewpoint', '富士見展望台',
+            'viewpoint', 250.0,
+            ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography,
+            '{"tourism":"viewpoint","direction":"250"}'::jsonb);
+
+    -- 名前の無いPOIは候補にしない（「この付近」と変わらないため）
+    INSERT INTO poi_reference (extract_version_id, osm_type, osm_id, name, name_ja,
+                               category, location)
+    VALUES (v_ver, 'node', 100002, NULL, NULL, 'viewpoint',
+            ST_SetSRID(ST_MakePoint(138.7275, 35.3607), 4326)::geography);
+
+    SELECT display_name, direction_deg INTO v_name, v_dir
+      FROM find_scenic_poi(35.3606, 138.7274, 150);
+
+    PERFORM assert_eq(v_name, '富士見展望台', '半径内の景観POIを日本語名で引ける');
+    PERFORM assert_eq(v_dir, 250.0::real, 'viewpoint の向きが方位セクターの事前情報として取れる');
+
+    -- 半径外は引かない
+    SELECT count(*)::int INTO v_cnt FROM find_scenic_poi(35.5000, 139.0000, 150);
+    PERFORM assert_eq(v_cnt, 0, '半径外のPOIは返さない');
+
+    -- 抽出バージョンを指定すれば、再計算で当時のデータを再現できる（docs/06 §4.2）
+    SELECT count(*)::int INTO v_cnt
+      FROM find_scenic_poi(35.3606, 138.7274, 150, (v_ver + 1)::smallint);
+    PERFORM assert_eq(v_cnt, 0, '抽出バージョンを指定すると、そのバージョンのPOIだけを見る');
+
+    -- 有効な抽出は同時に1つだけ
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            INSERT INTO poi_extract_versions (source_code, extract_url, extract_date, is_active)
+            VALUES ('osm', 'https://example.invalid/other.pbf', DATE '2026-09-01', true);
+        EXCEPTION WHEN unique_violation THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, '有効な抽出バージョンは同時に1つだけ');
+    END;
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 17. SEC-TRUST calc_trust_score — シグナル合成と帯域 =='
+-- ===========================================================================
+DO $$
+DECLARE
+    w jsonb := (SELECT weights FROM trust_rulesets WHERE is_active);
+    r jsonb;
+BEGIN
+    -- 何も分からない投稿は基準値 0.6 のまま（判定不能を減点にしない）
+    r := calc_trust_score(w, '{}'::jsonb);
+    PERFORM assert_eq((r ->> 'trust_score')::numeric, 0.6000, '判定できないシグナルは減点にしない');
+    PERFORM assert_eq(r ->> 'band', 'restricted', '基準値だけでは通常帯に届かない');
+
+    -- 素直な投稿は通常帯に入る
+    r := calc_trust_score(w, jsonb_build_object(
+        'exif_present', true, 'exif_distance_m', 120, 'exif_time_diff_days', 0.5,
+        'duplicate_image', false, 'travel_speed_mps', 12.4,
+        'device_attestation', 'pass', 'in_app_capture', true,
+        'account_age_hours', 900, 'user_trust_ewma', 0.72));
+    PERFORM assert_eq(r ->> 'band', 'normal', 'EXIF整合・アプリ内撮影・端末検証通過なら通常帯');
+
+    -- 転載は単独で保留帯まで落とす
+    r := calc_trust_score(w, jsonb_build_object('duplicate_image', true));
+    PERFORM assert_eq(r ->> 'band', 'held', '転載検出は単独で保留帯まで落とす');
+
+    -- 位置偽装は抑制帯まで落ちる（断定はしない）
+    r := calc_trust_score(w, jsonb_build_object(
+        'exif_present', true, 'exif_distance_m', 8000, 'exif_time_diff_days', 0.1));
+    PERFORM assert_true((r ->> 'trust_score')::numeric < 0.70,
+        'EXIF位置が投稿位置と大きくずれると通常帯から落ちる');
+
+    -- 物理的に不可能な移動
+    PERFORM assert_true(
+        (calc_trust_score(w, jsonb_build_object('travel_speed_mps', 500)) ->> 'trust_score')::numeric
+        < (calc_trust_score(w, jsonb_build_object('travel_speed_mps', 50)) ->> 'trust_score')::numeric,
+        '前回投稿から物理的に到達不可能な速度は減点される');
+
+    -- 未対応端末は加点も減点もしない（クライアント実装前は全件ここ）
+    PERFORM assert_eq(
+        (calc_trust_score(w, jsonb_build_object('device_attestation', 'unsupported'))
+           -> 'contributions' ->> 'device_attestation')::numeric,
+        0::numeric, '端末検証に未対応な端末は加点も減点もしない');
+
+    -- 0〜1 に収まる
+    r := calc_trust_score(w, jsonb_build_object(
+        'duplicate_image', true, 'device_attestation', 'fail',
+        'exif_present', false, 'exif_distance_m', 99999, 'travel_speed_mps', 9999));
+    PERFORM assert_true((r ->> 'trust_score')::numeric >= 0.0, '信頼度は負にならない');
+
+    -- 説明可能性: 内訳が復元できること（docs/04 §6 受け入れ条件）
+    PERFORM assert_true(
+        (r -> 'contributions') ? 'duplicate_image' AND (r ? 'raw'),
+        '寄与の内訳と生値が残り、誤検知の申し立てに答えられる');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 18. SEC-TRUST 帯域を既存の採点関数へ写す =='
+-- ===========================================================================
+DO $$
+DECLARE
+    tw jsonb := (SELECT weights FROM trust_rulesets WHERE is_active);
+    sw jsonb := (SELECT weights FROM scoring_rulesets WHERE is_active);
+BEGIN
+    PERFORM assert_eq(trust_penalty_mult(tw, 'normal'::trust_band),     1.0::real, '通常帯は減衰なし');
+    PERFORM assert_eq(trust_penalty_mult(tw, 'restricted'::trust_band), 0.5::real, '抑制帯は希少性を半減させる');
+    PERFORM assert_eq(trust_penalty_mult(tw, 'held'::trust_band),       0.0::real, '保留帯は希少性を出さない');
+
+    PERFORM assert_true(trust_first_bonus_eligible('normal'::trust_band),
+        '「初」ボーナスは通常帯だけ');
+    PERFORM assert_eq(trust_first_bonus_eligible('restricted'::trust_band), false,
+        '抑制帯では「初」ボーナスを出さない');
+
+    -- 既存の calc_rarity_score にそのまま渡せること（関数シグネチャは変更不要）
+    PERFORM assert_eq(
+        (calc_rarity_score(sw, 0, true, 90,
+                           trust_penalty_mult(tw, 'restricted'::trust_band)) ->> 'rarity_score')::numeric,
+        15.00, '抑制帯の減衰が既存の希少性計算にそのまま接続する');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 19. SEC-PRIV プライバシーゾーンとブロックリスト =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_user uuid := (SELECT id FROM users WHERE handle = 'user1');
+    v_home geography := ST_SetSRID(ST_MakePoint(139.7000, 35.6800), 4326)::geography;
+    v_far  geography := ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography;
+    v_ok   boolean := false;
+    r      record;
+    v_rows integer;
+    v_post uuid;
+    i      integer;
+BEGIN
+    -- ゾーンの制約
+    BEGIN
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, v_home, 100, 'hidden');
+    EXCEPTION WHEN check_violation THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '半径200m未満のプライバシーゾーンは作れない');
+
+    v_ok := false;
+    BEGIN
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, v_home, 500, 'exact');
+    EXCEPTION WHEN check_violation THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '劣化しないゾーン（exact）は作れない');
+
+    INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+    VALUES (v_user, v_home, 500, 'hidden');
+
+    -- ゾーン内なら exact を要求しても hidden まで落ちる
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_home, 'exact');
+    PERFORM assert_eq(r.effective_privacy, 'hidden'::location_privacy,
+        'ゾーン内の投稿はユーザーが exact を選んでいても強制的に落とす');
+    PERFORM assert_eq(r.rejected, false, 'ゾーンは投稿を拒否はしない');
+
+    -- ゾーン外は要求どおり
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_far, 'exact');
+    PERFORM assert_eq(r.effective_privacy, 'exact'::location_privacy,
+        'ゾーン外の投稿は要求どおりの公開レベルになる');
+
+    -- ユーザーの選択のほうが厳しければそちらを採る
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_far, 'coarse_500m');
+    PERFORM assert_eq(r.effective_privacy, 'coarse_500m'::location_privacy,
+        'ユーザーの選択のほうが厳しければそちらを採る');
+
+    -- ブロックリスト（保護区）
+    INSERT INTO location_blocklist (area, reason, policy, note)
+    VALUES (ST_SetSRID(ST_MakePolygon(ST_GeomFromText(
+                'LINESTRING(138.72 35.35, 138.74 35.35, 138.74 35.37, 138.72 35.37, 138.72 35.35)'
+            )), 4326)::geography,
+            'protected_species', 'reject', 'テスト用の保護区');
+
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_far, 'exact');
+    PERFORM assert_eq(r.rejected, true, '保護区への投稿は受け付けない');
+    PERFORM assert_eq(r.reason, 'protected_species', '拒否の理由をユーザーに返せる');
+
+    -- 5個上限。ここまでは通る（自宅ゾーンと合わせて5個）
+    FOR i IN 1..4 LOOP
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, ST_SetSRID(ST_MakePoint(139.70 + i * 0.1, 35.68), 4326)::geography,
+                300, 'coarse_500m');
+    END LOOP;
+
+    v_ok := false;
+    BEGIN
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, ST_SetSRID(ST_MakePoint(140.50, 35.68), 4326)::geography,
+                300, 'coarse_500m');
+    EXCEPTION WHEN others THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, 'プライバシーゾーンは1ユーザーあたり5個まで');
+
+    PERFORM assert_eq(
+        (SELECT zone_count::int FROM v_user_privacy_zone_summary WHERE user_id = v_user),
+        5, '公開してよいのはゾーンの個数まで（座標と半径は返さない）');
+
+    -- 遡及適用: ゾーン登録より前の投稿にも効く
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy)
+    VALUES (v_user, 'published', now(), v_home, 'exact') RETURNING id INTO v_post;
+
+    v_rows := reapply_privacy_zones(v_user);
+    PERFORM assert_true(v_rows >= 1, 'ゾーン登録前の投稿にも遡及適用される');
+    PERFORM assert_eq(
+        (SELECT location_privacy FROM posts WHERE id = v_post),
+        'hidden'::location_privacy, '自宅で撮った過去の投稿が後から保護される');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 20. SEC-PRIV 表示座標はビューでのみ返す =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_user uuid := (SELECT id FROM users WHERE handle = 'user2');
+    v_post uuid;
+    v_cell bigint := 613196570331971583;   -- H3 res8 相当のダミー
+    v_center geography := ST_SetSRID(ST_MakePoint(138.7300, 35.3600), 4326)::geography;
+    v_ok boolean := false;
+    v_cnt integer;
+BEGIN
+    INSERT INTO h3_cell_centers (h3_index, resolution, center)
+    VALUES (v_cell, 8, v_center);
+
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy, coarse_h3_r8)
+    VALUES (v_user, 'published', now(),
+            ST_SetSRID(ST_MakePoint(138.7312, 35.3591), 4326)::geography, 'coarse_500m', v_cell)
+    RETURNING id INTO v_post;
+
+    PERFORM assert_eq(
+        (SELECT ST_AsText(display_location::geometry) FROM v_post_location_public
+          WHERE post_id = v_post),
+        ST_AsText(v_center::geometry),
+        'coarse_500m の表示座標は生座標ではなくセル中心になる');
+
+    -- 同じセルの別投稿は必ず同じ表示座標になる。投稿側に座標を持たせていないので、
+    -- ジッターを入れようとしても入れる場所が無い（SEC-PRIV-02）。
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy, coarse_h3_r8)
+    VALUES (v_user, 'published', now(),
+            ST_SetSRID(ST_MakePoint(138.7320, 35.3585), 4326)::geography, 'coarse_500m', v_cell);
+
+    PERFORM assert_eq(
+        (SELECT count(DISTINCT ST_AsText(display_location::geometry))::int
+           FROM v_post_location_public v
+           JOIN posts p2 ON p2.id = v.post_id
+          WHERE p2.coarse_h3_r8 = v_cell),
+        1, '同じセルの投稿は必ず同じ表示座標になる（ジッターを入れる場所が無い）');
+
+    -- セル中心が登録されていない投稿は座標を返さない（未計算のまま公開しない）
+    v_ok := false;
+    BEGIN
+        INSERT INTO posts (author_id, status, captured_at, location, location_privacy, coarse_h3_r8)
+        VALUES (v_user, 'published', now(), v_center, 'coarse_500m', 999999999999999999);
+    EXCEPTION WHEN foreign_key_violation THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '中心座標を持たないセルは投稿に設定できない');
+
+    -- hidden は座標もスポット名も返さない
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy)
+    VALUES (v_user, 'published', now(), v_center, 'hidden') RETURNING id INTO v_post;
+
+    SELECT count(*)::int INTO v_cnt FROM v_post_location_public
+     WHERE post_id = v_post AND (display_location IS NOT NULL OR display_spot_name IS NOT NULL);
+    PERFORM assert_eq(v_cnt, 0, 'hidden の投稿は座標もスポット名も返さない');
+
+    -- 生座標を返す列がビューに存在しないこと
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_name = 'v_post_location_public'
+            AND column_name IN ('location', 'exif_location')),
+        0, '公開ビューは投稿の生座標を一切含まない（SEC-PRIV-02）');
 END;
 $$;
 
