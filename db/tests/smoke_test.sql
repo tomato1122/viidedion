@@ -1339,6 +1339,84 @@ END;
 $$;
 
 
+-- ===========================================================================
+\echo '== 24. 配信中の粒度バージョンのスポットは動かない（Blue-Green） =='
+-- ===========================================================================
+-- 再計算ジョブが対象バージョンを取り違えて active を渡しても、配信中の
+-- スポットが黙って移動しないこと（CLAUDE.md「既存行は絶対に UPDATE しない」）。
+DO $$
+DECLARE
+    v_active smallint := (SELECT id FROM spot_grain_versions WHERE status = 'active');
+    v_draft  smallint;
+    v_ident  uuid;
+    v_spot   uuid;
+    v_again  uuid;
+    v_pt     geography := ST_SetSRID(ST_MakePoint(140.0, 36.0), 4326)::geography;
+    v_moved  geography := ST_SetSRID(ST_MakePoint(140.5, 36.5), 4326)::geography;
+BEGIN
+    -- 通常の取り込みは active に対して走る。新規スポットの作成は止めない
+    v_spot := upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    PERFORM assert_true(v_spot IS NOT NULL, 'active な粒度でも新規スポットは作れる（取り込みを止めない）');
+
+    SELECT identity_id INTO v_ident FROM spots WHERE id = v_spot;
+
+    -- 同じ identity で座標違いを渡しても、配信中のスポットは動かない
+    v_again := upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294199::bigint, v_moved,
+        NULL, NULL, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_eq(v_again, v_spot, '既存実体があれば同じ実体を返す');
+    PERFORM assert_true(
+        ST_DWithin((SELECT centroid FROM spots WHERE id = v_spot), v_pt, 1.0),
+        'active な粒度では既存スポットの重心が動かない');
+    PERFORM assert_eq(
+        (SELECT h3_index FROM spots WHERE id = v_spot), 617700169958294100::bigint,
+        'active な粒度では h3_index も書き換わらない');
+
+    -- 未命名のスポットに名前を付けるのは配信中でも通す（命名フロー docs/01 §1.4）
+    PERFORM upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        '△△の桜並木', 'user'::spot_name_source, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_eq(
+        (SELECT display_name FROM spots WHERE id = v_spot), '△△の桜並木',
+        '未命名のスポットには配信中でも名前を付けられる');
+
+    -- 既に付いている名前は上書きしない（改名は rename_spot_identity を通す）
+    PERFORM upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        '別の名前', 'user'::spot_name_source, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_eq(
+        (SELECT display_name FROM spots WHERE id = v_spot), '△△の桜並木',
+        '既に名前があれば上書きしない（改名は alias に退避してから行う）');
+
+    -- 再計算はこれから組み立てるバージョンで行う。そこでは重心の更新が要る
+    INSERT INTO spot_grain_versions (
+        code, status, h3_resolution, snap_radius_m, poi_match_radius_m,
+        bearing_sector_count, dbscan_eps_m, dbscan_min_points, dbscan_min_users,
+        gps_accuracy_reject_m
+    ) VALUES ('g3-rebuild', 'draft', 9, 120, 150, 8, 80, 5, 3, 100)
+    RETURNING id INTO v_draft;
+
+    PERFORM upsert_spot_with_identity(
+        v_draft, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        NULL, NULL, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM upsert_spot_with_identity(
+        v_draft, 'cluster'::spot_kind, 617700169958294199::bigint, v_moved,
+        NULL, NULL, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_true(
+        ST_DWithin((SELECT centroid FROM spots
+                     WHERE grain_version_id = v_draft AND identity_id = v_ident), v_moved, 1.0),
+        '組み立て中（draft）の粒度では重心を更新できる');
+
+    -- 配信中の実体は draft をいじっても影響を受けない
+    PERFORM assert_true(
+        ST_DWithin((SELECT centroid FROM spots WHERE id = v_spot), v_pt, 1.0),
+        '新バージョンを組み立てても配信中の実体は元のまま');
+END;
+$$;
+
+
 \echo ''
 \echo 'ALL SMOKE TESTS PASSED'
 ROLLBACK;

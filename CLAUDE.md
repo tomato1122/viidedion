@@ -40,6 +40,10 @@ B-01（永続ID）・B-03（ランキングの受け皿）・B-05/B-06（docs/04
 粒度変更 = 新バージョンで全件を別レコードとして再計算し、最後に `status='active'` を
 差し替える（Blue-Green）。**既存行は絶対に UPDATE しない。**
 
+実体を作る入口は `upsert_spot_with_identity()` だけにする（`0013`）。`active` /
+`deprecated` のバージョンでは既存実体の重心を動かさない。新規スポットの作成は
+どの status でも通る（通常の取り込みは active に対して走るため）。
+
 「便利だから」と `posts.spot_id` や `posts.rarity_score` を足したくなるが、足した瞬間に
 この設計は死ぬ。レビューする際もここを最優先で見ること。
 
@@ -107,7 +111,7 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 
 ```
 docs/          設計ドキュメント（日本語）
-db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0012、連番・追記のみ）
+db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0013、連番・追記のみ）
 db/tests/      スキーマと関数のスモークテスト
 scoring/       ファセット導出規則（標準ライブラリのみ）
 scripts/       テスト実行
