@@ -62,10 +62,10 @@ posts (不変の観測事実)
        → 最近傍に bind。 kind は据え置き。            [SNAP]
        → 終了
 
-5. poi := AzureMaps.searchNearby(lat, lon, radius = grain.poi_match_radius_m,
-                                 categories = SCENIC_CATEGORIES)
+5. poi := find_scenic_poi(lat, lon, radius = grain.poi_match_radius_m,
+                            extract_version)          // 自前の poi_reference。外部APIではない
    IF poi が見つかる
-       → spots に upsert (kind='poi', external_id=poi.id, display_name=poi.name)
+       → spots に upsert (kind='poi', external_id='node/123', display_name=poi.name)
        → bind                                          [POI]
        → 終了
 
@@ -75,7 +75,7 @@ posts (不変の観測事実)
 
 **手順4が引継ぎ書§4の「セル境界で同一展望台が分割される」への回答**。セル所属で決めるのではなく、**セルは候補を引くためのインデックスとしてだけ使い、最終判定は正規スポット重心からの実距離で行う**。res9セルの境界に立っている展望台でも、先に登録された1つのスポットに全投稿が吸着する。
 
-**手順5のカテゴリフィルタは必須**。無条件POIマッチをすると、峠の絶景ポイントがすぐ隣のコンビニや自販機のPOI名を継承する。採用カテゴリは概ね以下（Azure Maps のカテゴリセット）:
+**手順5のカテゴリフィルタは必須**。無条件POIマッチをすると、峠の絶景ポイントがすぐ隣のコンビニや自販機のPOI名を継承する。採用カテゴリは概ね以下（OSMタグとの対応は [docs/06 §4.4](06-adr-poi-source.md)）:
 
 ```
 SCENIC_CATEGORIES =
@@ -85,9 +85,12 @@ SCENIC_CATEGORIES =
 
 一致しなければ手順6に落とす。**「無名の絶景を拾えない」問題は、POIで拾わずCELL→昇格ルートで拾う**（§1.3）。
 
-> **手順5は ADR-001 で置き換わった（§10）。** 外部POI APIは呼ばず、自前に取り込んだ
-> OSM抽出を PostGIS で近傍検索する（`find_scenic_poi()`）。SCENIC_CATEGORIES の
-> OSMタグ対応は [docs/06 §4.4](06-adr-poi-source.md)。
+> **手順5は ADR-001 で置き換わった（§10）。** 元は Azure Maps の POI 検索を呼ぶ設計だったが、
+> 規約上キャッシュを永続できず §4.3 の再計算が成立しないため、自前に取り込んだ
+> OSM抽出を PostGIS で近傍検索する方式にした。
+>
+> **実装**: `core/spots.py`（解決フロー全体）/ `core/clusters.py`（§1.3 の昇格）。
+> 入口は `worker/resolve.py` と `jobs/promote_clusters.py`。
 
 ### 1.3 CELL → 独自スポット昇格（DBSCAN）
 

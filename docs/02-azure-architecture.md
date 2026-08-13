@@ -37,7 +37,7 @@ flowchart TB
     end
 
     subgraph ext[外部]
-        MAPS[Azure Maps<br/>POI / Weather]
+        WEATHER[Azure Maps Weather<br/>履歴実況 ※T-12で確定]
     end
 
     APP -->|1. SAS発行要求| AFD --> API
@@ -46,13 +46,17 @@ flowchart TB
     INGEST -->|4. EXIF/pHash/サムネ| BLOB
     INGEST -->|5. enqueue| SB
     SB --> WORKER
-    WORKER -->|6. ①AI + ②希少性| PG
-    WORKER --> MAPS
+    WORKER -->|6. ①AI + スポット解決 + ②希少性| PG
+    WORKER --> WEATHER
     API -->|投票| PG
     SWEEP -->|7. 24h経過分の③確定| PG
-    JOB --> PG
+    JOB -->|昇格・再計算| PG
     API --> REDIS
 ```
+
+**POI は外部サービスに出ない。** ADR-001（docs/06）で OpenStreetMap の抽出を
+`poi_reference` として自前に取り込む方式に変えたため、スポット解決はすべて
+PostgreSQL 内で完結する。外部に出るのは天候だけ（それも T-12 で確定）。
 
 処理の要点は **「①は同期・②は同期・③だけ非同期」**。引継ぎ書§2の「確定タイミングをずらす」がそのままアーキテクチャの分割線になっている。
 
@@ -99,9 +103,11 @@ ingest の責務（CPUのみ・数百ms）:
 Service Bus をKEDAスケーラで受けて起動。キューが空なら **0レプリカ**に落ちる。
 
 ```
-1. ①AIベース点   : ONNX推論（§2）→ post_ai_scores
+1. ①AIベース点   : ONNX推論（§2）→ post_ai_scores                    ※未実装（T-14）
 2. スポット解決   : docs/01 §1.2 のフロー → post_spot_assignment
-                   （POIは spot_poi_cache を先に見て、無ければ Azure Maps）
+                   （POIは自前の poi_reference を PostGIS で近傍検索。
+                     外部APIは呼ばない → ADR-001 / docs/06）
+                   実装: core/spots.py（worker/resolve.py が入口）
 3. ②希少性ボーナス: 純SQL（db/migrations の calc_rarity_score）→ post_rarity_scores
 4. ③の受付開始    : post_community_scores に finalize_at = now() + 24h で行を作成
 5. posts.status = 'scored' → クライアントに①+②の暫定結果を返せる状態
@@ -287,7 +293,9 @@ pHashは64bitなので、`posts.phash bigint` に対して BK-tree を持たず�
 | Container Apps 採点ワーカー | **1レプリカ維持** | 3秒SLO（§1.3）とのトレードオフ。深夜のみ0 |
 | Functions (Flex Consumption) | ほぼ0 | — |
 | Blob Storage | 容量比例 | 90日経過した `raw` を Cool → Archive にライフサイクル移行 |
-| Azure Maps | 呼出比例 | **`spot_poi_cache` で必ずキャッシュ。** 再計算ジョブからは絶対に呼ばない（docs/01 §4.3） |
+| Azure Maps（POI） | **ゼロ** | ADR-001 で不採用。OSM抽出を自前に取り込むので呼出そのものが無い |
+| Azure Maps（Weather） | 呼出比例 | 派生値（`weather_kind`）だけを保存する。**生応答を溜めるテーブルは作らない**（規約。docs/06 §6）。採否は T-12 |
+| Container Apps Job（昇格・再計算） | 0にできる | 実行時だけ課金。夜間バッチなので日次で数分 |
 | Front Door | 下位SKUで固定費あり | MVPでは省略し、Blobの静的配信 + CDN無しで開始してもよい |
 
 MVPの構成目標は **固定費をPostgreSQLと採点ワーカーの2つだけに集約する**こと。それ以外はすべて従量かゼロスケールに寄せる。
@@ -300,6 +308,41 @@ MVPの構成目標は **固定費をPostgreSQLと採点ワーカーの2つだけ
 |---|---|---|
 | クライアント実装（ネイティブ / Flutter / React Native） | 未定 | EXIF `GPSImgDirection` の取得可否が端末依存なので、実機検証が先 |
 | Front Door を初期から入れるか | **MVPでは省略** | 配信量が読めてから |
-| 天候APIの選定 | Azure Maps Weather 想定 | 日本の粒度と課金。気象庁データとの比較 |
+| 天候APIの選定 | Azure Maps Weather 想定 | 日本の粒度と課金。気象庁データとの比較。**キャッシュ条項の制約あり（docs/06 §6）** |
 | ①の日本向けファインチューニングをいつ回すか | 投票データ1万件以降 | ③の投票が貯まる速度次第 |
 | 収益モデル | 未着手 | 引継ぎ書§8のまま |
+
+---
+
+## 9. 実装との対応
+
+構成図の各要素がどのコードに落ちているか。**未実装のものを「ある」ように書かない**ための表。
+
+| 構成要素 | デプロイ単位 | 実装 | 状態 |
+|---|---|---|---|
+| API（SAS発行・投票） | `api/` | — | **未着手（T-19）**。認証 T-31 待ち |
+| ingest（EXIF・pHash・サムネ） | `ingest/` | — | **未着手（T-13）** |
+| 採点ワーカー ①AI | `worker/` | — | **未着手（T-14）**。特徴量検証 T-07 / T-08 待ち |
+| 採点ワーカー スポット解決 | `worker/` | `core/spots.py` | ✅ 実装済み（T-15） |
+| 採点ワーカー ②希少性 | `worker/` | `calc_rarity_score`（SQL） | 関数は実装済み。呼び出し側が未着手 |
+| finalizer（③確定スイープ） | Functions or pg_cron | `calc_community_score`（SQL） | 関数は実装済み。スイープの起動は T-18 |
+| DBSCAN昇格バッチ | `jobs/` | `core/clusters.py` | ✅ 実装済み（T-16） |
+| 粒度再計算ジョブ | `jobs/` | — | **未着手（T-21）** |
+| ランキング再生成 | pg_cron | `rebuild_ranking_entries`（SQL） | ✅ 実装済み |
+
+### デプロイ単位の分け方
+
+```
+core/      デプロイ単位が共有するドメイン層（h3-py + psycopg）
+scoring/   ファセット導出規則（標準ライブラリのみ）
+worker/    採点ワーカー          Container Apps / Consumption
+jobs/      バッチ                Container Apps Job
+ingest/    取り込み              Functions / Flex Consumption   ※未着手
+api/       API                   Container Apps                 ※未着手
+```
+
+`core/` と `scoring/` は**デプロイ単位ではない**。各イメージに同梱する共有ライブラリで、
+それぞれのデプロイ単位が自分の `requirements.txt` を持つ。
+
+`scoring/` の「標準ライブラリのみ」規約は `scoring/` にだけ掛かる。DBの再計算ジョブから
+呼びやすくしておくための制約なので、`core/` 以降には適用しない。
