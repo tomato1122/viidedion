@@ -111,18 +111,30 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 
 ```
 docs/          設計ドキュメント（日本語）
-db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0013、連番・追記のみ）
+db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0014、連番・追記のみ）
 db/tests/      スキーマと関数のスモークテスト
 scoring/       ファセット導出規則（標準ライブラリのみ）
+core/          デプロイ単位が共有するドメイン層（h3-py + psycopg）
+worker/        採点ワーカー（Container Apps）
+jobs/          バッチ（Container Apps Job）
 scripts/       テスト実行
 ```
+
+**アプリコードはデプロイ単位で分ける。** `core/` と `scoring/` は共有ライブラリで、
+デプロイ単位ではない（イメージに同梱する）。各デプロイ単位が自分の `requirements.txt` を持つ。
+`ingest/`（T-13）・`api/`（T-19）は未着手。
+
+**`scoring/` の「標準ライブラリのみ」規約は `scoring/` にだけ掛かる。** `core/` 以降には掛からない。
 
 ## テスト
 
 ```bash
-./scripts/test.sh                                            # Python のみ
-PGHOST=/tmp PGPORT=5432 PGUSER=postgres ./scripts/test.sh    # + PostgreSQL
+./scripts/test.sh                                            # scoring/ のみ
+PGHOST=/tmp PGPORT=5432 PGUSER=postgres ./scripts/test.sh    # + PostgreSQL + core/
 ```
+
+`core/` のテストは h3-py と psycopg が要る（`pip install -r worker/requirements.txt`）。
+入っていなければスキップされ、SQL側の検証だけが走る。
 
 PostgreSQL のテストには **PostGIS 拡張が使えるサーバー**が必要。ローカルに無い場合は
 `apt-get install postgresql-16 postgresql-16-postgis-3` で入る。
@@ -148,6 +160,9 @@ PostgreSQL のテストには **PostGIS 拡張が使えるサーバー**が必�
 | **slug のサフィックスは `gen_random_uuid()` から作る** | `gen_random_bytes` は pgcrypto 依存。Azure の対応拡張の確認が済んでいない拡張には依存しない |
 | **ランキング再生成は一時テーブルを使わない** | plpgsql のプランキャッシュが消えた一時テーブルを掴む。進捗は `ranking_entries` 自体を見て判定する |
 | **POIは OSM 抽出を自前に取り込む（外部POI APIを呼ばない）** | Azure Maps は再計算目的の永続キャッシュを禁じている。自前データなら保持期限も課金も無い（ADR-001 / docs/06） |
+| **DBSCAN の近傍判定は PostGIS の `ST_DWithin`** | 球面近似ではなく測地線距離になり GiST索引も効く。numpy / scikit-learn を入れずに済む（docs/01 §1.3） |
+| **同一粒度で親 identity を引き継げる実体は1つだけ** | 2つ目は新しい identity を発行して `split` にする。確かめずに親を渡すと `ON CONFLICT` で離れた2地点が1スポットに潰れる（docs/01 §8.3） |
+| **系譜（carry_over）の判定は距離より `post_spot_assignment` を優先** | 暫定セルスポットの重心はグリッド由来で、解像度が変わると同じ場所でも100m近くずれる。距離だけで判定すると identity を作り直してURLと称号が切れる（docs/01 §8.3） |
 
 ### H3の解像度別統計は v4 の値を使う
 
@@ -168,6 +183,35 @@ PostgreSQL のテストには **PostGIS 拡張が使えるサーバー**が必�
   Azure Maps は「latency 低減目的・最大6か月」しか許しておらず、再計算のために溜めるのは
   規約違反にあたる（docs/06）。**キャッシュは実装の都合ではなくライセンスの問題。**
   再計算から参照するデータは、自前で保持できるライセンスのものだけにする
+
+## 変更の波及表（コミット前に必ず引く）
+
+**このプロジェクトで実際に3回やらかしている**ので、勘に頼らず表を引くこと。
+実装だけ直して設計書を放置すると、**設計書を読んだ側が古い設計を実装する**。
+一度は「規約違反と判定したはずのキャッシュ設計」を docs/02 が指示し続けていた。
+
+| 変更したもの | 波及を確認する場所 |
+|---|---|
+| `db/migrations/` にテーブル・関数を足した | `db/tests/smoke_test.sql` のアサーション / `docs/01 §5` のテーブル表 / `docs/02 §9` の対応表 |
+| スポット解決・粒度の挙動を変えた | `docs/01` の該当節（**注記ではなく擬似コード本体**）/ `docs/02 §1.3` |
+| 外部サービスの採否を変えた | `docs/02` の構成図(mermaid)・§1 パイプライン・§7 コスト表・§8 未決定 / 対応するADR |
+| セキュリティ要件を実装した | `docs/04` の該当 `SEC-XX-nn` / `docs/04 §11` の実装チェックリスト |
+| デプロイ単位を足した | `docs/02 §9` / このファイルの「リポジトリ構成」 |
+| タスクの状態が変わった | **`docs/03` と Notion の両方**（片方だけ更新しない） |
+| 配点・閾値を変えた | `scoring_rulesets` / `ranking_facet_levels`（テーブル。コードに定数で埋めない） |
+
+### 2つの原則
+
+**注記を足して本体を放置しない。** 擬似コード・構成図・表そのものを直す。
+「§10 で置き換わった」と欄外に書いても、読む側は擬似コード本体を写経する。
+実際にそれで `AzureMaps.searchNearby` が生き残っていた。
+
+**未実装を「ある」ように書かない。** `docs/02 §9` の対応表に実装状態を明示する。
+構成図に描いてあるものが全部動くと誤解されると、依存関係の判断が狂う。
+
+監査は `/design-sync` で機械的に回せる（`.claude/skills/design-sync/`）。
+
+---
 
 ## 事実確認のルール
 

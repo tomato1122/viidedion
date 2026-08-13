@@ -39,7 +39,7 @@ posts (不変の観測事実)
 |---|---|---|
 | `h3_resolution` | **9** | 平均六角形面積 0.1053 km² / 平均辺長 **200.8m**。展望台1つ〜駐車場+遊歩道程度が1セルに収まる |
 | `snap_radius_m` | **120** | 既存スポットへの吸着半径。res9の辺長より十分短くし、隣接セルの正規スポットに吸い寄せられるようにする |
-| `poi_match_radius_m` | **150** | Azure Maps POI検索半径 |
+| `poi_match_radius_m` | **150** | `poi_reference`（自前のOSM抽出）を近傍検索する半径。§10 |
 | `bearing_sector_count` | **8** | 45度刻み |
 | `dbscan_eps_m` | **80** | 昇格クラスタの密度基準 |
 | `dbscan_min_points` | **5** | 同上。「同じ場所で5回以上撮られた」を独自スポットの閾値とする |
@@ -62,10 +62,10 @@ posts (不変の観測事実)
        → 最近傍に bind。 kind は据え置き。            [SNAP]
        → 終了
 
-5. poi := AzureMaps.searchNearby(lat, lon, radius = grain.poi_match_radius_m,
-                                 categories = SCENIC_CATEGORIES)
+5. poi := find_scenic_poi(lat, lon, radius = grain.poi_match_radius_m,
+                            extract_version)          // 自前の poi_reference。外部APIではない
    IF poi が見つかる
-       → spots に upsert (kind='poi', external_id=poi.id, display_name=poi.name)
+       → spots に upsert (kind='poi', external_id='node/123', display_name=poi.name)
        → bind                                          [POI]
        → 終了
 
@@ -75,7 +75,7 @@ posts (不変の観測事実)
 
 **手順4が引継ぎ書§4の「セル境界で同一展望台が分割される」への回答**。セル所属で決めるのではなく、**セルは候補を引くためのインデックスとしてだけ使い、最終判定は正規スポット重心からの実距離で行う**。res9セルの境界に立っている展望台でも、先に登録された1つのスポットに全投稿が吸着する。
 
-**手順5のカテゴリフィルタは必須**。無条件POIマッチをすると、峠の絶景ポイントがすぐ隣のコンビニや自販機のPOI名を継承する。採用カテゴリは概ね以下（Azure Maps のカテゴリセット）:
+**手順5のカテゴリフィルタは必須**。無条件POIマッチをすると、峠の絶景ポイントがすぐ隣のコンビニや自販機のPOI名を継承する。採用カテゴリは概ね以下（OSMタグとの対応は [docs/06 §4.4](06-adr-poi-source.md)）:
 
 ```
 SCENIC_CATEGORIES =
@@ -85,9 +85,12 @@ SCENIC_CATEGORIES =
 
 一致しなければ手順6に落とす。**「無名の絶景を拾えない」問題は、POIで拾わずCELL→昇格ルートで拾う**（§1.3）。
 
-> **手順5は ADR-001 で置き換わった（§10）。** 外部POI APIは呼ばず、自前に取り込んだ
-> OSM抽出を PostGIS で近傍検索する（`find_scenic_poi()`）。SCENIC_CATEGORIES の
-> OSMタグ対応は [docs/06 §4.4](06-adr-poi-source.md)。
+> **手順5は ADR-001 で置き換わった（§10）。** 元は Azure Maps の POI 検索を呼ぶ設計だったが、
+> 規約上キャッシュを永続できず §4.3 の再計算が成立しないため、自前に取り込んだ
+> OSM抽出を PostGIS で近傍検索する方式にした。
+>
+> **実装**: `core/spots.py`（解決フロー全体）/ `core/clusters.py`（§1.3 の昇格）。
+> 入口は `worker/resolve.py` と `jobs/promote_clusters.py`。
 
 ### 1.3 CELL → 独自スポット昇格（DBSCAN）
 
@@ -109,6 +112,25 @@ SCENIC_CATEGORIES =
 ```
 
 昇格スポットは手順4の[SNAP]候補になるため、**以後その場所の投稿はセル境界に関係なく同じスポットに集まる**。
+
+#### 実装（`core/clusters.py` / `jobs/promote_clusters.py`）
+
+| 論点 | 決めたこと |
+|---|---|
+| 距離の測り方 | 近傍判定は PostGIS の `ST_DWithin`（geography）。球面近似ではなく測地線距離になり、GiST索引も効く。DBSCAN 本体（コア点判定と拡張）だけ Python |
+| 依存 | numpy / scikit-learn を入れない。密度計算をDB側に寄せてあるので不要。バッチ1本のためにイメージを重くしない |
+| `minPts` | **自分自身を含めた**点数。「同じ場所で5回以上撮られた」をそのまま数える |
+| 境界点の扱い | コア点からのみ到達可能性を伝播する。緩めるとまばらな点が数珠つなぎになり、峠一帯が1スポットになる |
+| 昇格スポットの永続ID | 同一粒度では `spots (grain_version_id, identity_id)` が一意なので、**必ず新しい identity を発行する**（元セルのものは使えない） |
+| 元セルとの関係 | `spot_lineage` に `split` として残す。元セルが空になった場合だけ `merge` にして旧 slug を昇格スポットへ向ける（配布済みの「この付近」URLを死なせない） |
+| `promoted_at` | **昇格が起きたセルにだけ印を付ける。** クラスタが立たなかったセルは印を付けず、投稿が増えてから再評価する |
+
+**張り替えた投稿の希少性②は古いままになる。** 同一粒度バージョン内でスポットが変わるので、
+`post_rarity_scores` と `spot_facet_stats` が実態とずれる。バッチは対象件数を出力するだけで、
+再計算は行わない（§4.3 / T-21 の担当）。**黙って進めないこと。**
+
+**既に昇格したセルは再評価しない。** 上の対象条件（`promoted_at IS NULL`）どおりだが、
+投稿が増え続けるセルで2つ目のクラスタが立っても拾えない。実データを見てから見直す。
 
 ### 1.4 命名の扱い
 
@@ -243,16 +265,29 @@ draft ──► shadow ──► active ──► deprecated ──► (archived
 ### 4.3 再計算ジョブ
 
 ```
-recalc(grain_version_id, from_post_id, batch_size = 5000)
-  1. posts を id 昇順で batch_size 件取得（カーソルは job_state に永続化）
-  2. 各投稿に §1.2 の解決フローを適用 → post_spot_assignment を INSERT
-     ※ POI検索で外部APIは呼ばない。自前の poi_reference を読む（§10 / ADR-001）
-       当時と同じ poi_extract_version を指定すること（指定しないと結果が変わる）
-  3. spot_facet_stats を集計し直す（post_count, first_post_id, last_post_at）
-  4. §1.3 の DBSCAN 昇格を全セルに対して実行
-  5. post_rarity_scores を再計算（②は決定的なので、同じ入力なら同じ出力）
-  6. ranking_entries を再生成
+recalc(grain_version_id)          -- 実装: core/recalc.py / jobs/recalc_grain.py
+
+  assign  : posts を id 昇順でバッチ処理し、§1.2 の解決フローを適用
+            → post_spot_assignment。カーソルは grain_recalc_runs に永続化
+            ※ POI検索で外部APIは呼ばない。自前の poi_reference を読む（§10 / ADR-001）
+              ランの開始時点の poi_extract_version を焼き付ける
+  promote : §1.3 の DBSCAN 昇格を全セルに対して実行
+  lineage : split を確定させる（§8.3）。**全件揃わないと判定できない**
+  rarity  : spot_facet_stats を作り直しながら post_rarity_scores を再計算
+  ranking : ranking_entries を再生成
 ```
+
+**フェーズの順序に意味がある。**
+
+- `promote` は紐付けを張り替えるので、必ず `rarity` より前。逆にすると張り替え前の
+  スポットで計算した②が残る
+- `lineage` と `rarity` を assign から分けてあるのは、split は投稿の分布を、
+  「初」判定は撮影時刻順の逐次処理を必要とし、**どちらも1件ずつの処理では確定できない**ため
+
+**対象は draft / shadow のみ。** 配信中のバージョンを作り直す操作は
+`grain_recalc_runs` のトリガで拒否する（§4.2 の Blue-Green を強制するため）。
+ただし `rarity` だけは配信中にも当てられる —— DBSCAN昇格（§1.3）が紐付けを
+張り替えた後の②を直す経路で、スポットは動かさないため。
 
 **冪等性が要件**。ジョブは途中で落ちる前提で、`ON CONFLICT (post_id, grain_version_id) DO UPDATE` と カーソル永続化で再開可能にする。
 
@@ -285,6 +320,7 @@ DDL全文は [`db/migrations/`](../db/migrations/)。ここでは意図だけ記
 | `spot_source` | 出自とライセンス条件（T-05 の置き場） | なし |
 | `spots` | スポット実体（kind, centroid, h3_index, display_name） | **あり** |
 | `ranking_facet_levels` | ランキングの粗さの階段の定義。§9 | なし |
+| `grain_recalc_runs` | 再計算のフェーズとカーソル。§4.3 | **あり** |
 | `post_discovery_labels` | 順位が付かなかった投稿の発見表現。§9 | **あり** |
 | `post_spot_assignment` | 投稿↔スポット + ファセットキー | **あり（I-2）** |
 | `spot_facet_stats` | ファセット別の累計・初回投稿 | **あり** |
@@ -294,7 +330,9 @@ DDL全文は [`db/migrations/`](../db/migrations/)。ここでは意図だけ記
 | `votes` | 2枚比較投票の生ログ | なし |
 | `ranking_periods` / `ranking_entries` | 週次リセットの器 | **あり** |
 | `post_integrity_checks` | 不正対策の判定結果（引継ぎ書§5） | なし |
-| `spot_poi_cache` | Azure Maps POI応答のキャッシュ | なし（再計算で再利用） |
+| `poi_reference` | 自前に取り込んだ景観POI（OSM抽出）。§10 | なし（再計算で再利用） |
+| `poi_extract_versions` | POI抽出のスナップショット。§10.3 | — |
+| `spot_poi_cache` | 外部POI応答のキャッシュ。**MVPでは未使用**（ADR-001）。保持上限180日を CHECK 制約で強制 | なし |
 
 ### なぜ H3インデックスをアプリ側で計算するか
 
@@ -395,7 +433,16 @@ spot_identity  ← URL・称号・訪問履歴はここを指す。粒度に依�
 
 `split` で `slug` を継ぐのを「最大シェアの子」に固定しているのは、機械的に一意に決まる規則が要るため。人手で決める余地を残すと粒度変更が止まる。
 
+**実装では距離判定より先に「その投稿が旧粒度でどのスポットに属していたか」を見る**（`core/spots.py`）。
+上の擬似コードは重心間の距離で書いてあるが、暫定セルスポット（`kind='h3_cell'`）の重心は
+グリッド由来の人工物で、**解像度が変わると同じ場所でも100m近くずれる**（res9 と res10 のセル中心）。
+距離だけで判定すると、同じ場所なのに `carry_over` を取り逃して identity を作り直し、
+URLと称号が切れる。`post_spot_assignment` を引けば厳密に決まるので、そちらを一次情報にした。
+距離判定は投稿の文脈が無い経路のフォールバックとして残してある。
+
 `merge` された側の `slug` は `spot_alias` に移り、`resolve_spot_slug()` が統合先まで辿る。**旧URLは 301 で生き続ける。**
+
+**親を引き継げるのは1つの実体だけ。** 同一粒度では `spots (grain_version_id, identity_id)` が一意なので、同じ親を2つの実体が引き継ごうとすると、後から来た方が `upsert_spot_with_identity` の `ON CONFLICT` に当たり、**離れた2地点が黙って1つのスポットに潰れて重心が動く**。実装（`core/spots.py` の `_claim_identity`）は、親が既に引き継がれていたら新しい identity を発行して `split` として記録する。**粒度を細かくする再計算でしか出ないので、通常の取り込みでは気づけない。**
 
 ### 8.4 称号の連続性
 
