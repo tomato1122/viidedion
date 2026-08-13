@@ -23,7 +23,7 @@ Instagram はフォロワー数が権力になる構造で後発ユーザーが�
 設計レビュー指摘書が Notion にある（B-01〜B-12）。**未対応の指摘が残っているので、
 新しい設計判断をする前に docs/03 の Phase 0 を確認すること。**
 B-01（永続ID）・B-03（ランキングの受け皿）・B-05/B-06（docs/04）・B-11（docs/06）は対応済み。
-残る Phase 0 は **T-31（認証）の実装**と、docs/04 §11 のマイグレーション。
+残る Phase 0 は **T-31（認証）** のみ。
 
 ---
 
@@ -100,7 +100,7 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 
 ```
 docs/          設計ドキュメント（日本語）
-db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0010、連番・追記のみ）
+db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0011、連番・追記のみ）
 db/tests/      スキーマと関数のスモークテスト
 scoring/       ファセット導出規則（標準ライブラリのみ）
 scripts/       テスト実行

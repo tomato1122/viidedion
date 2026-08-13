@@ -872,6 +872,248 @@ END;
 $$;
 
 
+-- ===========================================================================
+\echo '== 17. SEC-TRUST calc_trust_score — シグナル合成と帯域 =='
+-- ===========================================================================
+DO $$
+DECLARE
+    w jsonb := (SELECT weights FROM trust_rulesets WHERE is_active);
+    r jsonb;
+BEGIN
+    -- 何も分からない投稿は基準値 0.6 のまま（判定不能を減点にしない）
+    r := calc_trust_score(w, '{}'::jsonb);
+    PERFORM assert_eq((r ->> 'trust_score')::numeric, 0.6000, '判定できないシグナルは減点にしない');
+    PERFORM assert_eq(r ->> 'band', 'restricted', '基準値だけでは通常帯に届かない');
+
+    -- 素直な投稿は通常帯に入る
+    r := calc_trust_score(w, jsonb_build_object(
+        'exif_present', true, 'exif_distance_m', 120, 'exif_time_diff_days', 0.5,
+        'duplicate_image', false, 'travel_speed_mps', 12.4,
+        'device_attestation', 'pass', 'in_app_capture', true,
+        'account_age_hours', 900, 'user_trust_ewma', 0.72));
+    PERFORM assert_eq(r ->> 'band', 'normal', 'EXIF整合・アプリ内撮影・端末検証通過なら通常帯');
+
+    -- 転載は単独で保留帯まで落とす
+    r := calc_trust_score(w, jsonb_build_object('duplicate_image', true));
+    PERFORM assert_eq(r ->> 'band', 'held', '転載検出は単独で保留帯まで落とす');
+
+    -- 位置偽装は抑制帯まで落ちる（断定はしない）
+    r := calc_trust_score(w, jsonb_build_object(
+        'exif_present', true, 'exif_distance_m', 8000, 'exif_time_diff_days', 0.1));
+    PERFORM assert_true((r ->> 'trust_score')::numeric < 0.70,
+        'EXIF位置が投稿位置と大きくずれると通常帯から落ちる');
+
+    -- 物理的に不可能な移動
+    PERFORM assert_true(
+        (calc_trust_score(w, jsonb_build_object('travel_speed_mps', 500)) ->> 'trust_score')::numeric
+        < (calc_trust_score(w, jsonb_build_object('travel_speed_mps', 50)) ->> 'trust_score')::numeric,
+        '前回投稿から物理的に到達不可能な速度は減点される');
+
+    -- 未対応端末は加点も減点もしない（クライアント実装前は全件ここ）
+    PERFORM assert_eq(
+        (calc_trust_score(w, jsonb_build_object('device_attestation', 'unsupported'))
+           -> 'contributions' ->> 'device_attestation')::numeric,
+        0::numeric, '端末検証に未対応な端末は加点も減点もしない');
+
+    -- 0〜1 に収まる
+    r := calc_trust_score(w, jsonb_build_object(
+        'duplicate_image', true, 'device_attestation', 'fail',
+        'exif_present', false, 'exif_distance_m', 99999, 'travel_speed_mps', 9999));
+    PERFORM assert_true((r ->> 'trust_score')::numeric >= 0.0, '信頼度は負にならない');
+
+    -- 説明可能性: 内訳が復元できること（docs/04 §6 受け入れ条件）
+    PERFORM assert_true(
+        (r -> 'contributions') ? 'duplicate_image' AND (r ? 'raw'),
+        '寄与の内訳と生値が残り、誤検知の申し立てに答えられる');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 18. SEC-TRUST 帯域を既存の採点関数へ写す =='
+-- ===========================================================================
+DO $$
+DECLARE
+    tw jsonb := (SELECT weights FROM trust_rulesets WHERE is_active);
+    sw jsonb := (SELECT weights FROM scoring_rulesets WHERE is_active);
+BEGIN
+    PERFORM assert_eq(trust_penalty_mult(tw, 'normal'::trust_band),     1.0::real, '通常帯は減衰なし');
+    PERFORM assert_eq(trust_penalty_mult(tw, 'restricted'::trust_band), 0.5::real, '抑制帯は希少性を半減させる');
+    PERFORM assert_eq(trust_penalty_mult(tw, 'held'::trust_band),       0.0::real, '保留帯は希少性を出さない');
+
+    PERFORM assert_true(trust_first_bonus_eligible('normal'::trust_band),
+        '「初」ボーナスは通常帯だけ');
+    PERFORM assert_eq(trust_first_bonus_eligible('restricted'::trust_band), false,
+        '抑制帯では「初」ボーナスを出さない');
+
+    -- 既存の calc_rarity_score にそのまま渡せること（関数シグネチャは変更不要）
+    PERFORM assert_eq(
+        (calc_rarity_score(sw, 0, true, 90,
+                           trust_penalty_mult(tw, 'restricted'::trust_band)) ->> 'rarity_score')::numeric,
+        15.00, '抑制帯の減衰が既存の希少性計算にそのまま接続する');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 19. SEC-PRIV プライバシーゾーンとブロックリスト =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_user uuid := (SELECT id FROM users WHERE handle = 'user1');
+    v_home geography := ST_SetSRID(ST_MakePoint(139.7000, 35.6800), 4326)::geography;
+    v_far  geography := ST_SetSRID(ST_MakePoint(138.7274, 35.3606), 4326)::geography;
+    v_ok   boolean := false;
+    r      record;
+    v_rows integer;
+    v_post uuid;
+    i      integer;
+BEGIN
+    -- ゾーンの制約
+    BEGIN
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, v_home, 100, 'hidden');
+    EXCEPTION WHEN check_violation THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '半径200m未満のプライバシーゾーンは作れない');
+
+    v_ok := false;
+    BEGIN
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, v_home, 500, 'exact');
+    EXCEPTION WHEN check_violation THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '劣化しないゾーン（exact）は作れない');
+
+    INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+    VALUES (v_user, v_home, 500, 'hidden');
+
+    -- ゾーン内なら exact を要求しても hidden まで落ちる
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_home, 'exact');
+    PERFORM assert_eq(r.effective_privacy, 'hidden'::location_privacy,
+        'ゾーン内の投稿はユーザーが exact を選んでいても強制的に落とす');
+    PERFORM assert_eq(r.rejected, false, 'ゾーンは投稿を拒否はしない');
+
+    -- ゾーン外は要求どおり
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_far, 'exact');
+    PERFORM assert_eq(r.effective_privacy, 'exact'::location_privacy,
+        'ゾーン外の投稿は要求どおりの公開レベルになる');
+
+    -- ユーザーの選択のほうが厳しければそちらを採る
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_far, 'coarse_500m');
+    PERFORM assert_eq(r.effective_privacy, 'coarse_500m'::location_privacy,
+        'ユーザーの選択のほうが厳しければそちらを採る');
+
+    -- ブロックリスト（保護区）
+    INSERT INTO location_blocklist (area, reason, policy, note)
+    VALUES (ST_SetSRID(ST_MakePolygon(ST_GeomFromText(
+                'LINESTRING(138.72 35.35, 138.74 35.35, 138.74 35.37, 138.72 35.37, 138.72 35.35)'
+            )), 4326)::geography,
+            'protected_species', 'reject', 'テスト用の保護区');
+
+    SELECT * INTO r FROM resolve_location_privacy(v_user, v_far, 'exact');
+    PERFORM assert_eq(r.rejected, true, '保護区への投稿は受け付けない');
+    PERFORM assert_eq(r.reason, 'protected_species', '拒否の理由をユーザーに返せる');
+
+    -- 5個上限。ここまでは通る（自宅ゾーンと合わせて5個）
+    FOR i IN 1..4 LOOP
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, ST_SetSRID(ST_MakePoint(139.70 + i * 0.1, 35.68), 4326)::geography,
+                300, 'coarse_500m');
+    END LOOP;
+
+    v_ok := false;
+    BEGIN
+        INSERT INTO user_privacy_zones (user_id, center, radius_m, policy)
+        VALUES (v_user, ST_SetSRID(ST_MakePoint(140.50, 35.68), 4326)::geography,
+                300, 'coarse_500m');
+    EXCEPTION WHEN others THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, 'プライバシーゾーンは1ユーザーあたり5個まで');
+
+    PERFORM assert_eq(
+        (SELECT zone_count::int FROM v_user_privacy_zone_summary WHERE user_id = v_user),
+        5, '公開してよいのはゾーンの個数まで（座標と半径は返さない）');
+
+    -- 遡及適用: ゾーン登録より前の投稿にも効く
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy)
+    VALUES (v_user, 'published', now(), v_home, 'exact') RETURNING id INTO v_post;
+
+    v_rows := reapply_privacy_zones(v_user);
+    PERFORM assert_true(v_rows >= 1, 'ゾーン登録前の投稿にも遡及適用される');
+    PERFORM assert_eq(
+        (SELECT location_privacy FROM posts WHERE id = v_post),
+        'hidden'::location_privacy, '自宅で撮った過去の投稿が後から保護される');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 20. SEC-PRIV 表示座標はビューでのみ返す =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_user uuid := (SELECT id FROM users WHERE handle = 'user2');
+    v_post uuid;
+    v_cell bigint := 613196570331971583;   -- H3 res8 相当のダミー
+    v_center geography := ST_SetSRID(ST_MakePoint(138.7300, 35.3600), 4326)::geography;
+    v_ok boolean := false;
+    v_cnt integer;
+BEGIN
+    INSERT INTO h3_cell_centers (h3_index, resolution, center)
+    VALUES (v_cell, 8, v_center);
+
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy, coarse_h3_r8)
+    VALUES (v_user, 'published', now(),
+            ST_SetSRID(ST_MakePoint(138.7312, 35.3591), 4326)::geography, 'coarse_500m', v_cell)
+    RETURNING id INTO v_post;
+
+    PERFORM assert_eq(
+        (SELECT ST_AsText(display_location::geometry) FROM v_post_location_public
+          WHERE post_id = v_post),
+        ST_AsText(v_center::geometry),
+        'coarse_500m の表示座標は生座標ではなくセル中心になる');
+
+    -- 同じセルの別投稿は必ず同じ表示座標になる。投稿側に座標を持たせていないので、
+    -- ジッターを入れようとしても入れる場所が無い（SEC-PRIV-02）。
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy, coarse_h3_r8)
+    VALUES (v_user, 'published', now(),
+            ST_SetSRID(ST_MakePoint(138.7320, 35.3585), 4326)::geography, 'coarse_500m', v_cell);
+
+    PERFORM assert_eq(
+        (SELECT count(DISTINCT ST_AsText(display_location::geometry))::int
+           FROM v_post_location_public v
+           JOIN posts p2 ON p2.id = v.post_id
+          WHERE p2.coarse_h3_r8 = v_cell),
+        1, '同じセルの投稿は必ず同じ表示座標になる（ジッターを入れる場所が無い）');
+
+    -- セル中心が登録されていない投稿は座標を返さない（未計算のまま公開しない）
+    v_ok := false;
+    BEGIN
+        INSERT INTO posts (author_id, status, captured_at, location, location_privacy, coarse_h3_r8)
+        VALUES (v_user, 'published', now(), v_center, 'coarse_500m', 999999999999999999);
+    EXCEPTION WHEN foreign_key_violation THEN v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '中心座標を持たないセルは投稿に設定できない');
+
+    -- hidden は座標もスポット名も返さない
+    INSERT INTO posts (author_id, status, captured_at, location, location_privacy)
+    VALUES (v_user, 'published', now(), v_center, 'hidden') RETURNING id INTO v_post;
+
+    SELECT count(*)::int INTO v_cnt FROM v_post_location_public
+     WHERE post_id = v_post AND (display_location IS NOT NULL OR display_spot_name IS NOT NULL);
+    PERFORM assert_eq(v_cnt, 0, 'hidden の投稿は座標もスポット名も返さない');
+
+    -- 生座標を返す列がビューに存在しないこと
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_name = 'v_post_location_public'
+            AND column_name IN ('location', 'exif_location')),
+        0, '公開ビューは投稿の生座標を一切含まない（SEC-PRIV-02）');
+END;
+$$;
+
+
 \echo ''
 \echo 'ALL SMOKE TESTS PASSED'
 ROLLBACK;
