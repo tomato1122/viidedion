@@ -105,12 +105,13 @@ db/tests/      スキーマと関数のスモークテスト
 scoring/       ファセット導出規則（標準ライブラリのみ）
 core/          デプロイ単位が共有するドメイン層（h3-py + psycopg）
 worker/        採点ワーカー（Container Apps）
+jobs/          バッチ（Container Apps Job）
 scripts/       テスト実行
 ```
 
 **アプリコードはデプロイ単位で分ける。** `core/` と `scoring/` は共有ライブラリで、
 デプロイ単位ではない（イメージに同梱する）。各デプロイ単位が自分の `requirements.txt` を持つ。
-`ingest/`（T-13）・`api/`（T-19）・`jobs/`（T-16 / T-21）は未着手。
+`ingest/`（T-13）・`api/`（T-19）は未着手。
 
 **`scoring/` の「標準ライブラリのみ」規約は `scoring/` にだけ掛かる。** `core/` 以降には掛からない。
 
@@ -147,6 +148,7 @@ PostgreSQL のテストには **PostGIS 拡張が使えるサーバー**が必�
 | **slug のサフィックスは `gen_random_uuid()` から作る** | `gen_random_bytes` は pgcrypto 依存。Azure の対応拡張の確認が済んでいない拡張には依存しない |
 | **ランキング再生成は一時テーブルを使わない** | plpgsql のプランキャッシュが消えた一時テーブルを掴む。進捗は `ranking_entries` 自体を見て判定する |
 | **POIは OSM 抽出を自前に取り込む（外部POI APIを呼ばない）** | Azure Maps は再計算目的の永続キャッシュを禁じている。自前データなら保持期限も課金も無い（ADR-001 / docs/06） |
+| **DBSCAN の近傍判定は PostGIS の `ST_DWithin`** | 球面近似ではなく測地線距離になり GiST索引も効く。numpy / scikit-learn を入れずに済む（docs/01 §1.3） |
 | **系譜（carry_over）の判定は距離より `post_spot_assignment` を優先** | 暫定セルスポットの重心はグリッド由来で、解像度が変わると同じ場所でも100m近くずれる。距離だけで判定すると identity を作り直してURLと称号が切れる（docs/01 §8.3） |
 
 ### H3の解像度別統計は v4 の値を使う

@@ -1,0 +1,7 @@
+# バッチ（Container Apps Job）のデプロイ依存。
+#
+# DBSCAN の近傍判定は PostGIS の ST_DWithin に寄せてあるので、
+# numpy / scikit-learn は要らない。バッチ1本のためにイメージを重くしない。
+
+h3==4.5.0
+psycopg[binary]==3.3.4
