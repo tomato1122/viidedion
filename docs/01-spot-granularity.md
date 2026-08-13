@@ -39,7 +39,7 @@ posts (不変の観測事実)
 |---|---|---|
 | `h3_resolution` | **9** | 平均六角形面積 0.1053 km² / 平均辺長 **200.8m**。展望台1つ〜駐車場+遊歩道程度が1セルに収まる |
 | `snap_radius_m` | **120** | 既存スポットへの吸着半径。res9の辺長より十分短くし、隣接セルの正規スポットに吸い寄せられるようにする |
-| `poi_match_radius_m` | **150** | Azure Maps POI検索半径 |
+| `poi_match_radius_m` | **150** | `poi_reference`（自前のOSM抽出）を近傍検索する半径。§10 |
 | `bearing_sector_count` | **8** | 45度刻み |
 | `dbscan_eps_m` | **80** | 昇格クラスタの密度基準 |
 | `dbscan_min_points` | **5** | 同上。「同じ場所で5回以上撮られた」を独自スポットの閾値とする |
@@ -306,7 +306,9 @@ DDL全文は [`db/migrations/`](../db/migrations/)。ここでは意図だけ記
 | `votes` | 2枚比較投票の生ログ | なし |
 | `ranking_periods` / `ranking_entries` | 週次リセットの器 | **あり** |
 | `post_integrity_checks` | 不正対策の判定結果（引継ぎ書§5） | なし |
-| `spot_poi_cache` | Azure Maps POI応答のキャッシュ | なし（再計算で再利用） |
+| `poi_reference` | 自前に取り込んだ景観POI（OSM抽出）。§10 | なし（再計算で再利用） |
+| `poi_extract_versions` | POI抽出のスナップショット。§10.3 | — |
+| `spot_poi_cache` | 外部POI応答のキャッシュ。**MVPでは未使用**（ADR-001）。保持上限180日を CHECK 制約で強制 | なし |
 
 ### なぜ H3インデックスをアプリ側で計算するか
 
