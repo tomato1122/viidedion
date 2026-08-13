@@ -43,3 +43,21 @@ echo "== PostgreSQL: スモークテスト =="
 psql -v ON_ERROR_STOP=1 -d "$DB_NAME" -f db/tests/smoke_test.sql 2>&1 \
     | grep -E '^(psql:.*NOTICE:|==|ALL SMOKE)' \
     | sed -E 's/^psql:[^ ]+ NOTICE: //'
+
+# core/ は h3-py と psycopg に依存する（scoring/ の「標準ライブラリのみ」規約は
+# scoring/ にだけ掛かる）。入っていなければスキップし、SQL側の検証は落とさない。
+if ! python3 -c "import h3, psycopg" 2>/dev/null; then
+    echo
+    echo "== Python: スポット解決フロー（スキップ: pip install -r worker/requirements.txt） =="
+    exit 0
+fi
+
+echo
+echo "== Python: スポット解決フロー =="
+# 各テストはトランザクションをロールバックするので、スモークテスト後のDBを汚さない
+if [[ -n "${DATABASE_URL:-}" ]]; then
+    CORE_DSN="$DATABASE_URL"
+else
+    CORE_DSN="dbname=${DB_NAME}"
+fi
+DATABASE_URL="$CORE_DSN" python3 -m unittest discover -s core/tests -t .
