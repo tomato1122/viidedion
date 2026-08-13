@@ -40,6 +40,10 @@ B-01（永続ID）・B-03（ランキングの受け皿）・B-05/B-06（docs/04
 粒度変更 = 新バージョンで全件を別レコードとして再計算し、最後に `status='active'` を
 差し替える（Blue-Green）。**既存行は絶対に UPDATE しない。**
 
+実体を作る入口は `upsert_spot_with_identity()` だけにする（`0013`）。`active` /
+`deprecated` のバージョンでは既存実体の重心を動かさない。新規スポットの作成は
+どの status でも通る（通常の取り込みは active に対して走るため）。
+
 「便利だから」と `posts.spot_id` や `posts.rarity_score` を足したくなるが、足した瞬間に
 この設計は死ぬ。レビューする際もここを最優先で見ること。
 
@@ -77,7 +81,8 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 
 絶対評価の点数を晒すと低スコア帯のユーザーから静かに離脱する。
 
-- **生の合計点は非公開。** `v_post_total_score` は内部専用でAPIから返さない
+- **生の合計点は非公開。** `v_post_total_score` と `v_user_personal_best_internal` は
+  内部専用でAPIから返さない
 - **公開してよいのは `v_post_display` だけ**（相対指標のみ）
 - **減点・下位順位は一切表示しない。** 上位50%に入らなければ順位は `NULL`
 - 他人との比較より「自分の過去ベスト更新」を主軸に置く逃げ道を用意する
@@ -93,6 +98,12 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 - `gps_accuracy_m <= 100`
 - EXIF位置・時刻の整合チェックを通過
 - 同一ユーザーが同一スポットで直近24時間に「初」を取っていない
+- `trust_score` が通常帯（SEC-TRUST-02）
+
+判定は `is_first_bonus_eligible(post_id, grain_version_id)` に集約してある（`0012`）。
+**`record_facet_post` の `p_eligible` にリテラルの `true` を渡さないこと。**
+落ちた理由は `first_bonus_eligibility()` が jsonb で返す。
+チェック未実施は「通過」扱いにしない（チェックを飛ばす経路がそのまま抜け道になる）。
 
 ---
 
@@ -100,7 +111,7 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 
 ```
 docs/          設計ドキュメント（日本語）
-db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0011、連番・追記のみ）
+db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0013、連番・追記のみ）
 db/tests/      スキーマと関数のスモークテスト
 scoring/       ファセット導出規則（標準ライブラリのみ）
 scripts/       テスト実行
@@ -132,6 +143,7 @@ PostgreSQL のテストには **PostGIS 拡張が使えるサーバー**が必�
 | **データストアは PostgreSQL + PostGIS** | 中核機能（ファセット内の相対順位）が全てウィンドウ関数。Cosmos DBだとアプリ側集計になる |
 | **③の24時間確定はスイープ方式** | Durable Functions は投稿1件ごとにインスタンスが生きる。O(1)のスイープで足りる |
 | **配点の重みは `scoring_rulesets` テーブル** | 運用しながら必ず動かす。コードに定数で埋めると、どの投稿がどの重みで採点されたか追えなくなる |
+| **採点に使われたルールセットは凍結する** | 同上。in-place で重みを書き換えると過去の採点行が「採点当時と違う重み」を指す。変更は `publish_scoring_ruleset()` で新しい版を切る（`scoring_rulesets` / `trust_rulesets` ともトリガで強制） |
 | **ランキングの階段は `ranking_facet_levels` テーブル** | 同上。閾値（投稿数・ユニーク投稿者数）は実データを見て必ず動かす |
 | **slug のサフィックスは `gen_random_uuid()` から作る** | `gen_random_bytes` は pgcrypto 依存。Azure の対応拡張の確認が済んでいない拡張には依存しない |
 | **ランキング再生成は一時テーブルを使わない** | plpgsql のプランキャッシュが消えた一時テーブルを掴む。進捗は `ranking_entries` 自体を見て判定する |
