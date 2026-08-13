@@ -1114,6 +1114,309 @@ END;
 $$;
 
 
+-- ===========================================================================
+\echo '== 21. ルールセットは採点された時点で凍結する =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_active smallint := (SELECT id FROM scoring_rulesets WHERE is_active);
+    v_before jsonb    := (SELECT weights FROM scoring_rulesets WHERE is_active);
+    v_free   smallint;
+    v_new    smallint;
+    v_ok     boolean := false;
+BEGIN
+    -- 前提: ここまでの節で active なルールセットを使った採点行が積まれている
+    PERFORM assert_true(
+        EXISTS (SELECT 1 FROM post_rarity_scores WHERE ruleset_id = v_active),
+        '前提: active なルールセットは既に採点に使われている');
+
+    -- まだ採点に使われていない版は自由に編集できる（seed の調整まで止めない）
+    INSERT INTO scoring_rulesets (code, is_active, weights, note)
+    VALUES ('r-test-draft', false, '{"rarity_first": 8.0}'::jsonb, '検証用')
+    RETURNING id INTO v_free;
+    UPDATE scoring_rulesets SET weights = weights || '{"probe": 1}'::jsonb WHERE id = v_free;
+    PERFORM assert_true(
+        (SELECT weights ? 'probe' FROM scoring_rulesets WHERE id = v_free),
+        '採点に使われていないルールセットの重みは編集できる');
+
+    -- 1件でも採点に使われたら、以後は書き換えられない
+    BEGIN
+        UPDATE scoring_rulesets SET weights = weights || '{"probe": 2}'::jsonb WHERE id = v_active;
+    EXCEPTION WHEN others THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '採点に使われた重みは後から書き換えられない');
+
+    -- 重みを変えない UPDATE は通る（active の差し替えと注記の追記に要る）
+    UPDATE scoring_rulesets SET note = COALESCE(note, '') || '/検証' WHERE id = v_active;
+
+    -- 変更は新しい版として積む
+    v_new := publish_scoring_ruleset('r-test-next', '{"probe": 2}'::jsonb, '検証用の次版');
+    PERFORM assert_true(v_new <> v_active, '新しい版は別の行として作られる');
+    PERFORM assert_eq(
+        (SELECT weights FROM scoring_rulesets WHERE id = v_active), v_before,
+        '旧版の重みは採点当時のまま残る');
+    PERFORM assert_eq(
+        (SELECT id FROM scoring_rulesets WHERE is_active), v_new,
+        'active は新しい版に移る');
+    PERFORM assert_eq(
+        (SELECT (weights ->> 'rarity_first')::numeric FROM scoring_rulesets WHERE id = v_new),
+        (v_before ->> 'rarity_first')::numeric,
+        '新しい版は現行の重みを引き継ぐ（差分だけ渡せば済む）');
+END;
+$$;
+
+-- 信頼度ルールセットも同じ理由で凍結する（誤検知の申し立てに答えられなくなるため）
+DO $$
+DECLARE
+    v_active smallint := (SELECT id FROM trust_rulesets WHERE is_active);
+    v_post   uuid;
+    v_ok     boolean := false;
+BEGIN
+    -- この重みで1件判定した状態を作る
+    INSERT INTO posts (author_id, status, captured_at)
+    VALUES ((SELECT id FROM users WHERE handle = 'user3'), 'published', now())
+    RETURNING id INTO v_post;
+    INSERT INTO post_trust_scores (post_id, ruleset_id, trust_score, signals, band)
+    VALUES (v_post, v_active, 0.7, '{}'::jsonb, 'normal');
+
+    BEGIN
+        UPDATE trust_rulesets SET weights = weights || '{"probe": 1}'::jsonb WHERE id = v_active;
+    EXCEPTION WHEN others THEN
+        v_ok := true;
+    END;
+    PERFORM assert_true(v_ok, '判定に使われた信頼度の重みは後から書き換えられない');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 22. 自己ベストは点数を返さない =='
+-- ===========================================================================
+DO $$
+BEGIN
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_name = 'v_user_personal_best'
+            AND column_name IN ('best_total_score', 'total_score')),
+        0, '公開する自己ベストのビューは生の合計点を含まない（docs/00 §3 変更禁止）');
+
+    PERFORM assert_true(
+        (SELECT count(*) FROM information_schema.columns
+          WHERE table_name = 'v_user_personal_best_internal'
+            AND column_name = 'best_total_score') = 1,
+        '内部用ビューには点数が残る（通知と再計算の判定に要る）');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 23. 「初」ボーナスの発行条件（docs/01 §3.3） =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_grain  smallint := (SELECT v FROM t_grain WHERE k = 'grain');
+    v_author uuid     := (SELECT id FROM users WHERE handle = 'user7');
+    v_other  uuid     := (SELECT id FROM users WHERE handle = 'user8');
+    v_truleset smallint := (SELECT id FROM trust_rulesets WHERE is_active);
+    v_ident  uuid;
+    v_spot   uuid;
+    v_post   uuid;
+    v_bad    uuid;
+BEGIN
+    -- 他の節の統計と干渉しないよう、専用のスポットを作る
+    INSERT INTO spot_identity (slug, canonical_name, name_source, source_code, representative_point)
+    VALUES ('first-bonus-test', '検証用展望台', 'poi', 'azure_maps',
+            ST_SetSRID(ST_MakePoint(139.0, 35.0), 4326)::geography)
+    RETURNING id INTO v_ident;
+
+    INSERT INTO spots (identity_id, grain_version_id, kind, h3_index, centroid,
+                       display_name, name_source, poi_source, source_code, poi_external_id)
+    VALUES (v_ident, v_grain, 'poi', 617700169958293999,
+            ST_SetSRID(ST_MakePoint(139.0, 35.0), 4326)::geography,
+            '検証用展望台', 'poi', 'azure_maps', 'azure_maps', 'poi-test-first')
+    RETURNING id INTO v_spot;
+
+    -- 全条件を満たす投稿
+    INSERT INTO posts (author_id, status, captured_at, weather, timeslot, season, gps_accuracy_m)
+    VALUES (v_author, 'published', now(), 'clear', 'golden', 'summer', 20)
+    RETURNING id INTO v_post;
+    INSERT INTO post_spot_assignment (post_id, grain_version_id, spot_id, h3_index, bearing_sector, bind_method)
+    VALUES (v_post, v_grain, v_spot, 617700169958293999, 2, 'poi');
+    INSERT INTO post_integrity_checks (post_id, check_kind, passed) VALUES
+        (v_post, 'exif_location_match', true),
+        (v_post, 'exif_time_match',     true);
+    INSERT INTO post_trust_scores (post_id, ruleset_id, trust_score, signals, band)
+    VALUES (v_post, v_truleset, 0.8, '{}'::jsonb, 'normal');
+
+    PERFORM assert_true(is_first_bonus_eligible(v_post, v_grain),
+        '全条件を満たす投稿には「初」の発行資格がある');
+
+    -- 未割当の投稿には資格が無い（関数が黙って true を返さないこと）
+    INSERT INTO posts (author_id, status, captured_at, weather, timeslot, season, gps_accuracy_m)
+    VALUES (v_author, 'published', now(), 'clear', 'golden', 'summer', 20)
+    RETURNING id INTO v_bad;
+    PERFORM assert_eq(is_first_bonus_eligible(v_bad, v_grain), false,
+        'スポット未割当の投稿には発行資格が無い');
+
+    -- 方位不明
+    UPDATE post_spot_assignment SET bearing_sector = NULL
+     WHERE post_id = v_post AND grain_version_id = v_grain;
+    PERFORM assert_eq(
+        (first_bonus_eligibility(v_post, v_grain) ->> 'has_bearing')::boolean, false,
+        '方位が取れていなければ資格を落とす（方位を消せば全方位で初が取れてしまうため）');
+    PERFORM assert_eq(is_first_bonus_eligible(v_post, v_grain), false, '方位不明では「初」を出さない');
+    UPDATE post_spot_assignment SET bearing_sector = 2
+     WHERE post_id = v_post AND grain_version_id = v_grain;
+
+    -- 天候不明
+    UPDATE posts SET weather = NULL WHERE id = v_post;
+    PERFORM assert_eq(is_first_bonus_eligible(v_post, v_grain), false, '天候不明では「初」を出さない');
+    UPDATE posts SET weather = 'clear' WHERE id = v_post;
+
+    -- 測位精度
+    UPDATE posts SET gps_accuracy_m = 101 WHERE id = v_post;
+    PERFORM assert_eq(is_first_bonus_eligible(v_post, v_grain), false,
+        'gps_accuracy_m が 100m を超えたら「初」を出さない');
+    UPDATE posts SET gps_accuracy_m = 100 WHERE id = v_post;
+    PERFORM assert_true(is_first_bonus_eligible(v_post, v_grain), '境界の 100m ちょうどは通す');
+
+    -- 低信頼フラグ
+    UPDATE post_spot_assignment SET low_confidence = true
+     WHERE post_id = v_post AND grain_version_id = v_grain;
+    PERFORM assert_eq(is_first_bonus_eligible(v_post, v_grain), false,
+        'low_confidence な割当には「初」を出さない');
+    UPDATE post_spot_assignment SET low_confidence = false
+     WHERE post_id = v_post AND grain_version_id = v_grain;
+
+    -- EXIF整合チェックが未実施なら「通過」扱いにしない
+    DELETE FROM post_integrity_checks WHERE post_id = v_post AND check_kind = 'exif_time_match';
+    PERFORM assert_eq(
+        (first_bonus_eligibility(v_post, v_grain) ->> 'integrity_ok')::boolean, false,
+        'EXIF整合チェックが未実施なら通過扱いにしない（チェックを走らせない経路が抜け道になる）');
+    INSERT INTO post_integrity_checks (post_id, check_kind, passed)
+    VALUES (v_post, 'exif_time_match', true);
+
+    -- チェックに落ちていれば当然だめ
+    UPDATE post_integrity_checks SET passed = false
+     WHERE post_id = v_post AND check_kind = 'exif_location_match';
+    PERFORM assert_eq(is_first_bonus_eligible(v_post, v_grain), false,
+        'EXIF位置の整合チェックに落ちた投稿には「初」を出さない');
+    UPDATE post_integrity_checks SET passed = true
+     WHERE post_id = v_post AND check_kind = 'exif_location_match';
+
+    -- 信頼度の帯域（0011 の trust_first_bonus_eligible をここに畳み込んでいる）
+    UPDATE post_trust_scores SET band = 'restricted' WHERE post_id = v_post;
+    PERFORM assert_eq(is_first_bonus_eligible(v_post, v_grain), false,
+        '抑制帯の投稿には「初」を出さない（SEC-TRUST-02）');
+    DELETE FROM post_trust_scores WHERE post_id = v_post;
+    PERFORM assert_eq(
+        (first_bonus_eligibility(v_post, v_grain) ->> 'trust_ok')::boolean, false,
+        '信頼度が未判定なら通過扱いにしない（trust の計算を飛ばす経路が抜け道になる）');
+    INSERT INTO post_trust_scores (post_id, ruleset_id, trust_score, signals, band)
+    VALUES (v_post, v_truleset, 0.8, '{}'::jsonb, 'normal');
+
+    -- 同一ユーザーが同一スポットで直近24時間に「初」を取っている
+    PERFORM record_facet_post(v_grain, v_spot, 6::smallint, 'rain'::weather_kind,
+                              'noon'::timeslot_kind, 'summer'::season_kind,
+                              v_bad, now(), true);
+    PERFORM assert_eq(is_first_bonus_eligible(v_post, v_grain), false,
+        '同一ユーザーが同一スポットで24時間以内に「初」を取っていたら出さない（方位を変えた連投を塞ぐ）');
+
+    -- 24時間より前なら再び取れる
+    UPDATE spot_facet_stats SET first_post_at = now() - interval '25 hours'
+     WHERE grain_version_id = v_grain AND spot_id = v_spot AND bearing_sector = 6;
+    PERFORM assert_true(is_first_bonus_eligible(v_post, v_grain),
+        '24時間を過ぎていれば同じスポットでも再び「初」を取れる');
+
+    -- 他人が「初」を取っていても自分の資格は落ちない
+    UPDATE posts SET author_id = v_other WHERE id = v_bad;
+    UPDATE spot_facet_stats SET first_post_at = now()
+     WHERE grain_version_id = v_grain AND spot_id = v_spot AND bearing_sector = 6;
+    PERFORM assert_true(is_first_bonus_eligible(v_post, v_grain),
+        '他人が直前に「初」を取っていても自分の資格には影響しない');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 24. 配信中の粒度バージョンのスポットは動かない（Blue-Green） =='
+-- ===========================================================================
+-- 再計算ジョブが対象バージョンを取り違えて active を渡しても、配信中の
+-- スポットが黙って移動しないこと（CLAUDE.md「既存行は絶対に UPDATE しない」）。
+DO $$
+DECLARE
+    v_active smallint := (SELECT id FROM spot_grain_versions WHERE status = 'active');
+    v_draft  smallint;
+    v_ident  uuid;
+    v_spot   uuid;
+    v_again  uuid;
+    v_pt     geography := ST_SetSRID(ST_MakePoint(140.0, 36.0), 4326)::geography;
+    v_moved  geography := ST_SetSRID(ST_MakePoint(140.5, 36.5), 4326)::geography;
+BEGIN
+    -- 通常の取り込みは active に対して走る。新規スポットの作成は止めない
+    v_spot := upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        NULL, NULL, NULL, NULL, NULL, NULL);
+    PERFORM assert_true(v_spot IS NOT NULL, 'active な粒度でも新規スポットは作れる（取り込みを止めない）');
+
+    SELECT identity_id INTO v_ident FROM spots WHERE id = v_spot;
+
+    -- 同じ identity で座標違いを渡しても、配信中のスポットは動かない
+    v_again := upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294199::bigint, v_moved,
+        NULL, NULL, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_eq(v_again, v_spot, '既存実体があれば同じ実体を返す');
+    PERFORM assert_true(
+        ST_DWithin((SELECT centroid FROM spots WHERE id = v_spot), v_pt, 1.0),
+        'active な粒度では既存スポットの重心が動かない');
+    PERFORM assert_eq(
+        (SELECT h3_index FROM spots WHERE id = v_spot), 617700169958294100::bigint,
+        'active な粒度では h3_index も書き換わらない');
+
+    -- 未命名のスポットに名前を付けるのは配信中でも通す（命名フロー docs/01 §1.4）
+    PERFORM upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        '△△の桜並木', 'user'::spot_name_source, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_eq(
+        (SELECT display_name FROM spots WHERE id = v_spot), '△△の桜並木',
+        '未命名のスポットには配信中でも名前を付けられる');
+
+    -- 既に付いている名前は上書きしない（改名は rename_spot_identity を通す）
+    PERFORM upsert_spot_with_identity(
+        v_active, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        '別の名前', 'user'::spot_name_source, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_eq(
+        (SELECT display_name FROM spots WHERE id = v_spot), '△△の桜並木',
+        '既に名前があれば上書きしない（改名は alias に退避してから行う）');
+
+    -- 再計算はこれから組み立てるバージョンで行う。そこでは重心の更新が要る
+    INSERT INTO spot_grain_versions (
+        code, status, h3_resolution, snap_radius_m, poi_match_radius_m,
+        bearing_sector_count, dbscan_eps_m, dbscan_min_points, dbscan_min_users,
+        gps_accuracy_reject_m
+    ) VALUES ('g3-rebuild', 'draft', 9, 120, 150, 8, 80, 5, 3, 100)
+    RETURNING id INTO v_draft;
+
+    PERFORM upsert_spot_with_identity(
+        v_draft, 'cluster'::spot_kind, 617700169958294100::bigint, v_pt,
+        NULL, NULL, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM upsert_spot_with_identity(
+        v_draft, 'cluster'::spot_kind, 617700169958294199::bigint, v_moved,
+        NULL, NULL, NULL, NULL, v_ident, 'carry_over'::spot_lineage_op);
+    PERFORM assert_true(
+        ST_DWithin((SELECT centroid FROM spots
+                     WHERE grain_version_id = v_draft AND identity_id = v_ident), v_moved, 1.0),
+        '組み立て中（draft）の粒度では重心を更新できる');
+
+    -- 配信中の実体は draft をいじっても影響を受けない
+    PERFORM assert_true(
+        ST_DWithin((SELECT centroid FROM spots WHERE id = v_spot), v_pt, 1.0),
+        '新バージョンを組み立てても配信中の実体は元のまま');
+END;
+$$;
+
+
 \echo ''
 \echo 'ALL SMOKE TESTS PASSED'
 ROLLBACK;
