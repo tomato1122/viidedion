@@ -42,6 +42,16 @@
 Azure Maps に固定される（MapLibre + OSMタイル等の上に POI 名を重ねられない）。
 T-20（クライアントアプリ）の選択肢を先に狭めることになる。
 
+**付記（2026-08-13 追加調査）**: [Migrate from Google Maps to Azure Maps の Licensing
+considerations](https://learn.microsoft.com/azure/azure-maps/migrate-from-google-maps#licensing-considerations)
+には「Azure Maps allows data from its platform to be stored in Azure. Also, data can be
+cached elsewhere for up to six months」という記述があり、Azure 内保存に限れば禁止条項の
+対象外という読み方も成り立つ。Microsoft Q&A では「店舗ロケーターのように住所を事前ジオコード
+して座標を保存する」用途は想定内とされ、条項の意図は「独自のジオコーディングサービスを構築して
+API 呼び出しを回避すること」の防止と解釈されている。本アプリの用途（POI を1回引いて
+全ユーザーに地図上で表示し続ける）はその中間に位置し、**解釈が割れる。**
+プロダクトの中核機能を、解釈の割れる条項の上に置くことは避けたいという判断は変わらない。
+
 ### Google Places
 
 出典: [Places API policies](https://developers.google.com/maps/documentation/places/web-service/policies)
@@ -185,8 +195,13 @@ notable buildings」）。
   のが筋（どちらも全件再計算を伴うため）。T-21 で確定する。
 - **逆ジオコーディングの出所。** 昇格スポットの暫定名（docs/01 §1.4）に使う。
   OSM 抽出から行政区画名を引ければ外部APIは不要になるが、未検証。
-- **OSM の日本の `tourism=viewpoint` カバレッジ。** T-10（H3解像度の決定）で実データを
-  集めるときに同時に測る。薄ければ §5 の「POIを使わない」案に退避する。
+- **OSM の日本の `tourism=viewpoint` カバレッジ → 解消（2026-08-13、Overpass API で実測）。**
+  日本国内で `tourism=viewpoint` **6,658件** / `natural=cape` **1,617件**。
+  空白の地図（P-02「地図ファースト」の初期状態）を埋めるには十分な密度があると判断できる。
+  一方 `name:en` を持つのは viewpoint のうち **970件（14.6%）** に留まり、`name:ja_rm` /
+  `name:ja_kana` はレート制限で未計測。**多くの OSM 由来スポットは日本語名を持たず、
+  slug 生成が座標ベースにフォールバックする比率が高くなる見込み**（docs/01 §8.2 の
+  `generate_spot_slug()` を参照。ローマ字化への改善余地は docs/adr/0005 に記録した）。
 - **天候API（T-12）への波及。** Azure Maps Weather にも同じキャッシュ条項が掛かる。
   `posts.weather` は応答そのものではなく `weather_kind` に分類した派生値なので
   「Results のキャッシュ」には当たらないと解釈しているが、**天候の生応答を溜めるテーブルは
