@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import h3
 
-__all__ = ["cell_of", "ring_of", "center_of", "resolution_of"]
+__all__ = ["cell_of", "ring_of", "center_of", "resolution_of", "parent_of", "to_str"]
 
 
 def cell_of(lat: float, lon: float, resolution: int) -> int:
@@ -40,3 +40,21 @@ def center_of(cell: int) -> tuple[float, float]:
 
 def resolution_of(cell: int) -> int:
     return h3.get_resolution(h3.int_to_str(cell))
+
+
+def parent_of(cell: int, resolution: int) -> int:
+    """より粗い解像度の祖先セル。
+
+    地図のズームアウト集約（T-19 の map-clusters）専用。粒度バージョンの
+    `h3_resolution`（同定に使う解像度）とは別物 —— こちらは表示のための
+    後から計算する集約キーで、`spots.h3_index` を書き換えたりしない。
+    """
+    return h3.str_to_int(h3.cell_to_parent(h3.int_to_str(cell), resolution))
+
+
+def to_str(cell: int) -> str:
+    """DBの bigint 表現を、APIレスポンスなど外部向けの文字列表現に戻す。
+
+    intのままJSONに乗せると言語によっては精度が壊れるため、外部に出す直前でだけ使う。
+    """
+    return h3.int_to_str(cell)

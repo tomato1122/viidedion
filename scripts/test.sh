@@ -61,3 +61,16 @@ else
     CORE_DSN="dbname=${DB_NAME}"
 fi
 DATABASE_URL="$CORE_DSN" python3 -m unittest discover -s core/tests -t .
+
+# api/ は fastapi 一式が要る（pip install -r api/requirements.txt）。
+# 入っていなければスキップする。api/tests はリクエストごとにコミットするので
+# （api/deps.py 参照）、DB は使い回さずテストデータに乱数サフィックスを振ってある。
+if ! python3 -c "import fastapi" 2>/dev/null; then
+    echo
+    echo "== Python: API（スキップ: pip install -r api/requirements.txt） =="
+    exit 0
+fi
+
+echo
+echo "== Python: API =="
+DATABASE_URL="$CORE_DSN" python3 -m unittest discover -s api/tests -t .

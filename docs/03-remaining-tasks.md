@@ -216,6 +216,7 @@ Azure Maps Weather の履歴実況 vs 気象庁アメダス。日本での粒度
 | T-17 | 方位分散評価バッチ（`bearing_split_enabled` の自動更新） | T-11 |
 | T-18 | ③確定スイープ（finalizer） | T-09 |
 | T-19 | API（FastAPI / Container Apps）+ SAS発行 + 投票ペアのサンプリング（[ADR-0004](adr/0004-comparison-pair-composition.md) の階層的構成） | T-31, T-09 |
+| ~~T-19 一部~~ | ~~地図クラスタ・スポット詳細・SAS発行・投稿コミット・自己ベスト~~ **✅ 実装済み（`api/`）**。投票・フォローは未実装のまま残す（下記 DESIGN_DECISION_REQUIRED / T-33・T-35 待ち） | — |
 | T-20 | クライアントアプリ | T-11 |
 | ~~T-21~~ | ~~粒度再計算ジョブ~~ **✅ 完了（`core/recalc.py`）** | — |
 | T-22 | IaC（Bicep）と CI/CD | T-06 |
@@ -244,6 +245,39 @@ T-16（DBSCAN昇格）が投稿の紐付けを張り替えると、`post_rarity_
 粒度を細かくする再計算（1スポットが2つに割れる場面）でしか出ないので、通常の取り込みでは
 気づけない。`_claim_identity()` で親が既に引き継がれていたら新しい identity を発行し、
 `split` として記録するように直した（docs/01 §8.3）。
+
+---
+
+## サブからの提案: `posts.captured_at` とアップロード2段フローの矛盾
+
+```
+DESIGN_DECISION_REQUIRED
+
+気づいた状況:
+- T-19（API）で POST /uploads を実装中、docs/02 §1.1 の手順2（posts行をSAS発行前に作る）
+  を素直に実装しようとしたところ、posts.captured_at が NOT NULL・デフォルト無しのため
+  INSERT できなかった。撮影時刻は手順5（commit）まで分からない。
+
+影響範囲:
+- DB（`posts` テーブルの制約）/ Architecture Docs（docs/02 §1.1 の手順図）
+
+現在の実装への影響:
+- `api/routers/uploads.py` は暫定策として captured_at = now() を仮値でINSERTし、
+  commit で必ず実測値に上書きしている。スキーマは変更していない
+  （Implementation Lead は migration を変更しない — docs/07 §6）。
+- commit 前の行は location が NULL のままなので、採点パイプライン
+  （core.spots.bind_post が location を要求する）には絶対に入らない
+
+提案:
+- A案: captured_at を nullable にし、NOT NULL は「published後」等の別の制約で守る
+- B案: captured_at に posted_at 相当のデフォルト（now()）を持たせ、commit時に上書きする
+  現行の暫定策をそのまま正式な設計として採用する
+- 推奨案: B（Aは既存の calc_rarity_score 等が captured_at を前提にしている箇所への
+  影響調査が要るため、変更コストが高い）
+
+判断されるまで:
+- api/ の暫定策のまま。マイグレーションは追加しない
+```
 
 ---
 

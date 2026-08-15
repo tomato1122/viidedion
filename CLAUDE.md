@@ -141,12 +141,17 @@ scoring/       ファセット導出規則（標準ライブラリのみ）
 core/          デプロイ単位が共有するドメイン層（h3-py + psycopg）
 worker/        採点ワーカー（Container Apps）
 jobs/          バッチ（Container Apps Job）
+api/           API（Container Apps）。地図クラスタ・スポット詳細・SAS発行・投稿コミット・
+               自己ベストのみ実装（T-19一部）。投票・フォローは未実装（docs/03 参照）
 scripts/       テスト実行
 ```
 
 **アプリコードはデプロイ単位で分ける。** `core/` と `scoring/` は共有ライブラリで、
 デプロイ単位ではない（イメージに同梱する）。各デプロイ単位が自分の `requirements.txt` を持つ。
-`ingest/`（T-13）・`api/`（T-19）は未着手。
+`ingest/`（T-13）は未着手。
+
+`api/` の認証は T-31（未実装）の仮実装（`api/deps.py` の `get_current_user_id`。
+`X-User-Id` ヘッダーをそのまま信じるだけの開発用踏み台）。本番では絶対に使わないこと。
 
 **`scoring/` の「標準ライブラリのみ」規約は `scoring/` にだけ掛かる。** `core/` 以降には掛からない。
 
@@ -158,7 +163,8 @@ PGHOST=/tmp PGPORT=5432 PGUSER=postgres ./scripts/test.sh    # + PostgreSQL + co
 ```
 
 `core/` のテストは h3-py と psycopg が要る（`pip install -r worker/requirements.txt`）。
-入っていなければスキップされ、SQL側の検証だけが走る。
+`api/` のテストはさらに fastapi 一式が要る（`pip install -r api/requirements.txt`）。
+入っていなければそれぞれスキップされ、その手前までの検証だけが走る。
 
 PostgreSQL のテストには **PostGIS 拡張が使えるサーバー**が必要。ローカルに無い場合は
 `apt-get install postgresql-16 postgresql-16-postgis-3` で入る。

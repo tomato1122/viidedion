@@ -1,0 +1,15 @@
+# API（Container Apps）のデプロイ依存。
+#
+# デプロイ単位ごとに要るものだけを書く。イメージには core/ を同梱する
+# （リポジトリ内のパッケージなので、ここには書かない）。
+
+h3==4.5.0
+psycopg[binary]==3.3.4
+fastapi==0.141.1
+uvicorn[standard]==0.34.0
+pydantic-settings==2.7.1
+
+# api/blob.py は storage_account_url が設定されているときだけ import する
+# （ローカル開発・CIでは入れなくてもAPI全体は起動する）。本番イメージには含める。
+azure-identity==1.25.3
+azure-storage-blob==12.30.0

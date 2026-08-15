@@ -80,6 +80,15 @@ PostgreSQL 内で完結する。外部に出るのは天候だけ（それも T-
 
 SASはアカウントキーではなく **User Delegation SAS**（Entra ID裏付け）を使う。アカウントキーはそもそも無効化しておく。
 
+> **DESIGN_DECISION_REQUIRED（2026-08-15、T-19実装中に発見。`docs/03` にも記録）**:
+> 手順2で `posts` 行を作る時点では撮影時刻（手順5で初めて分かる）が無いが、
+> `posts.captured_at` は `NOT NULL` でデフォルトが無い。スキーマとこの図が矛盾している。
+> Implementation Lead は migration を変更する権限が無いため（`docs/07-agent-roles.md` §6）、
+> `api/routers/uploads.py` は暫定策として **手順2で `captured_at = now()` を仮値で入れ、
+> 手順5で必ず実測値に上書きする**運用で回避した。スキーマは変更していない。
+> Architecture Lead が確認し、`captured_at` を nullable にする／デフォルトを設ける／
+> この暫定策のまま採用する、のいずれかを決めること。
+
 ### 1.2 ingest（Azure Functions / Flex Consumption）
 
 `raw` コンテナへの `BlobCreated` を **Event Grid ベースの Blob トリガー** で受ける。ポーリング方式（`LogsAndContainerScan`）ではなく `source = EventGrid` を明示すること。レイテンシが桁で違い、**Flex Consumption プランはそもそもイベントベースのトリガーしかサポートしない**。
@@ -320,7 +329,9 @@ MVPの構成目標は **固定費をPostgreSQLと採点ワーカーの2つだけ
 
 | 構成要素 | デプロイ単位 | 実装 | 状態 |
 |---|---|---|---|
-| API（SAS発行・投票） | `api/` | — | **未着手（T-19）**。認証 T-31 待ち |
+| API 地図クラスタ・スポット詳細・SAS発行・投稿コミット・自己ベスト | `api/` | `api/main.py` | ✅ 実装済み（T-19 一部）。認証はT-31待ちの仮実装（`api/deps.py`） |
+| API 投票（ペアのサンプリング） | `api/` | — | **未着手。** ADR-0004 の `pair_tier` 実装・自己投票拒否が前提（`docs/07-agent-roles.md` §16） |
+| API フォロー | `api/` | — | **未着手。** `spot_follows` テーブル未実装（`docs/03` T-33相当） |
 | ingest（EXIF・pHash・サムネ） | `ingest/` | — | **未着手（T-13）** |
 | 採点ワーカー ①AI | `worker/` | — | **未着手（T-14）**。特徴量検証 T-07 / T-08 待ち |
 | 採点ワーカー スポット解決 | `worker/` | `core/spots.py` | ✅ 実装済み（T-15） |
@@ -339,7 +350,7 @@ scoring/   ファセット導出規則（標準ライブラリのみ）
 worker/    採点ワーカー          Container Apps / Consumption
 jobs/      バッチ                Container Apps Job
 ingest/    取り込み              Functions / Flex Consumption   ※未着手
-api/       API                   Container Apps                 ※未着手
+api/       API                   Container Apps                 ※一部実装（T-19）
 ```
 
 `core/` と `scoring/` は**デプロイ単位ではない**。各イメージに同梱する共有ライブラリで、

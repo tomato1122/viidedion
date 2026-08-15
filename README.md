@@ -24,10 +24,13 @@
 
 | | 内容 |
 |---|---|
-| [db/migrations/](db/migrations/) | PostgreSQL 16 + PostGIS のスキーマ（0001〜0007） |
-| [db/tests/smoke_test.sql](db/tests/smoke_test.sql) | スキーマと関数の振る舞い検証（46アサーション） |
+| [db/migrations/](db/migrations/) | PostgreSQL 16 + PostGIS のスキーマ（0001〜0014、連番・追記のみ） |
+| [db/tests/smoke_test.sql](db/tests/smoke_test.sql) | スキーマと関数の振る舞い検証（154アサーション） |
 | [scoring/facets.py](scoring/facets.py) | ファセット導出規則（方位セクター・時間帯・季節・フラクタル選好曲線） |
 | [scoring/tests/](scoring/tests/) | 同上のテスト（33ケース） |
+| [core/](core/) | デプロイ単位が共有するドメイン層 — スポット解決（T-15）、DBSCAN昇格（T-16）、粒度再計算（T-21） |
+| [worker/](worker/) / [jobs/](jobs/) | 採点ワーカー・バッチ（Container Apps）。①AI採点（T-14）は未着手 |
+| [api/](api/) | API（T-19 一部）— 地図クラスタ・スポット詳細・SAS発行・投稿コミット・自己ベスト。投票・フォローは未実装、認証はT-31待ちの仮実装 |
 
 ## 設計上の3つの不変条件
 
@@ -63,7 +66,8 @@ PostgreSQL のテストには PostGIS 拡張が使えるサーバーが必要。
 
 ## 次のタスク
 
-- クライアント実装（EXIF `GPSImgDirection` の取得可否を実機で確認するのが先）
-- ①AI採点ワーカー（ONNX Runtime + Scenic-Or-Not 転移学習）の実装
-- スポット解決フローの実装（`h3-py` + Azure Maps POI）
-- 未決定事項は各ドキュメントの末尾「未決定のまま残した点」を参照
+- ingest Functions（EXIF・pHash・サムネ・不正チェック。T-13）
+- ①AI採点ワーカー（ONNX Runtime + Scenic-Or-Not 転移学習。T-14。特徴量検証 T-07/T-08 待ち）
+- 投票API（比較ペアのサンプリング。ADR-0004 の `pair_tier` 実装・自己投票拒否が前提）
+- クライアント実装（EXIF `GPSImgDirection` の取得可否を実機で確認するのが先。T-11）
+- 残タスクの全体像は [docs/03-remaining-tasks.md](docs/03-remaining-tasks.md) を参照
