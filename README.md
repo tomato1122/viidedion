@@ -16,7 +16,9 @@
 | [docs/02-azure-architecture.md](docs/02-azure-architecture.md) | **Azureインフラ構成** — 採点パイプライン、推論ホスティング、データストア選定、③の遅延集計 |
 | [docs/03-remaining-tasks.md](docs/03-remaining-tasks.md) | **残タスク一覧** — レビュー指摘の未対応分を含む |
 | [docs/04-security-design.md](docs/04-security-design.md) | **セキュリティ設計** — 認証、位置情報プライバシー、trust_score、投票の完全性 |
-| [docs/05-product-decisions.md](docs/05-product-decisions.md) | **未決定のプロダクト決定** — ターゲット、フィード、投票の供給、コールドスタート |
+| [docs/05-product-decisions.md](docs/05-product-decisions.md) | **プロダクト決定記録** — P-01〜P-08 は決定済み。未決定は P-09（安全・誘導リスク）のみ |
+| [docs/06-adr-poi-source.md](docs/06-adr-poi-source.md) / [docs/adr/](docs/adr/) | **ADR** — POIソース（ADR-001）、ランキング期間（ADR-0001）、比較ペア構成（ADR-0004）ほか |
+| [docs/07-agent-roles.md](docs/07-agent-roles.md) | **AIエージェント役割分担・並行開発ルール** |
 
 ## 実装
 

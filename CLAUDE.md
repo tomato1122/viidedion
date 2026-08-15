@@ -20,6 +20,7 @@ Instagram はフォロワー数が権力になる構造で後発ユーザーが�
 | [docs/05-product-decisions.md](docs/05-product-decisions.md) | **プロダクト決定記録**。P-01〜P-08 は決定済み（2026-08-13）。未決定は P-09 のみ |
 | [docs/06-adr-poi-source.md](docs/06-adr-poi-source.md) | **ADR-001 POIソースの選定**。OSM採用の根拠と引き受けた義務。T-05 |
 | [docs/adr/](docs/adr/) | **ADR**。技術決定の記録。決定を覆すときは書き換えず新しい ADR を足す |
+| [docs/07-agent-roles.md](docs/07-agent-roles.md) | **AIエージェント役割分担・並行開発ルール**。Architecture Lead（ChatGPT）/ Implementation Lead（Claude）等の境界線。Notion が正 |
 
 設計レビュー指摘書が Notion にある（B-01〜B-12）。**未対応の指摘が残っているので、
 新しい設計判断をする前に docs/03 の Phase 0 を確認すること。**

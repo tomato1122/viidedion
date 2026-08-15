@@ -1,6 +1,6 @@
 # 残タスク一覧
 
-> 最終更新: 2026-08-14
+> 最終更新: 2026-08-15
 > Notion の [残タスク一覧](https://app.notion.com/p/3ba7066098c28199b6cfd5a5254dce31) と同じ内容。**片方だけ更新しないこと。**
 >
 > 出典の `B-xx` / `G-xx` は [設計レビュー指摘書](https://app.notion.com/p/3ba7066098c281d2a67def2da8717255) の項番。
@@ -244,6 +244,23 @@ T-16（DBSCAN昇格）が投稿の紐付けを張り替えると、`post_rarity_
 粒度を細かくする再計算（1スポットが2つに割れる場面）でしか出ないので、通常の取り込みでは
 気づけない。`_claim_identity()` で親が既に引き継がれていたら新しい identity を発行し、
 `split` として記録するように直した（docs/01 §8.3）。
+
+---
+
+## 資料間の矛盾のうち未解決（M-1 / M-6）
+
+> 旧 Notion ページの「資料間の矛盾（追跡中）」で追跡していたが、docs/05 を決定記録へ
+> 書き換えた際にこの一覧が引き継がれず落ちていた（design-sync 監査で 2026-08-15 に発覚）。
+> **`0008` 以降のどのマイグレーションでも未修正**であることを実際のスキーマで確認済み。
+
+| ID | 内容 | 現状 |
+|---|---|---|
+| M-1 | `votes.weight` の CHECK が `docs/04` SEC-VOTE-02（作成24時間未満のアカウントの票を `weight = 0` で記録するシャドウバン方式）と衝突 | `db/migrations/0004_scoring.sql` の `votes_weight_ck` は依然 `CHECK (weight > 0 AND weight <= 3.0)`。**`weight = 0` の INSERT が拒否される** |
+| M-6 | `docs/04` SEC-TRUST-02 の保留帯（`trust_score < 0.40`）は「非公開 + レビューキュー行き」だが、それを実施する仕組みが無い | `post_trust_scores.band` に `'held'` は保存できる（`0011`）が、**`band = 'held'` を見て投稿を非公開にするビュー・ゲートがまだ無い**。`v_post_display` 等の公開ビューで `band` を参照している箇所は無し |
+
+**両方とも T-13（ingest）または T-19（API）着手前に Architecture Lead 側でスキーマ・ビューの
+設計判断が必要。** Implementation Lead は CHECK 制約の変更・公開ビューの条件追加を単独で
+行わない（`docs/07` §6）。
 
 ---
 
