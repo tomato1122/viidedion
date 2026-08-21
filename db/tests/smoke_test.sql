@@ -1470,6 +1470,176 @@ END;
 $$;
 
 
+-- ===========================================================================
+\echo '== 26. M-1 シャドウバン票（weight 0）は記録されるが効かない =='
+-- ===========================================================================
+-- SEC-VOTE-02: 作成24時間未満のアカウントの票は「受け付けるが効かせない」。
+-- 拒否すると攻撃者に閾値が伝わるため（docs/04 §7）。
+DO $$
+DECLARE
+    v_author uuid := (SELECT id FROM users WHERE handle = 'user1');
+    v_new    uuid := (SELECT id FROM users WHERE handle = 'user2');
+    v_a uuid; v_b uuid;
+    v_elo_before numeric; v_n_before integer;
+BEGIN
+    INSERT INTO posts (author_id, status, captured_at) VALUES (v_author, 'published', now())
+    RETURNING id INTO v_a;
+    INSERT INTO posts (author_id, status, captured_at) VALUES (v_author, 'published', now())
+    RETURNING id INTO v_b;
+    INSERT INTO post_community_scores (post_id, finalize_at) VALUES (v_a, now() + interval '24 hours');
+    INSERT INTO post_community_scores (post_id, finalize_at) VALUES (v_b, now() + interval '24 hours');
+
+    SELECT elo_rating, vote_count INTO v_elo_before, v_n_before
+      FROM post_community_scores WHERE post_id = v_a;
+
+    -- weight 0 の票は制約に弾かれず記録される
+    PERFORM apply_vote(v_new, v_a, v_b, 0::real);
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM votes WHERE voter_id = v_new AND winner_post_id = v_a),
+        1, 'weight 0 の票も votes に記録される（拒否すると攻撃者に検知される）');
+
+    -- Elo は動かない
+    PERFORM assert_eq(
+        (SELECT elo_rating FROM post_community_scores WHERE post_id = v_a),
+        v_elo_before, 'weight 0 の票は Elo を動かさない');
+
+    -- vote_count も動かない。動かすと confidence が上がって③の確定値がずれる
+    PERFORM assert_eq(
+        (SELECT vote_count FROM post_community_scores WHERE post_id = v_a),
+        v_n_before, 'weight 0 の票は vote_count を増やさない（縮約の confidence を動かさないため）');
+    PERFORM assert_eq(
+        (SELECT vote_count FROM post_community_scores WHERE post_id = v_b),
+        v_n_before, '敗者側の vote_count も増やさない');
+
+    -- 同じペアの再投票は従来どおりユニーク制約で弾かれる（シャドウバンが露見しない）
+    DECLARE v_ok boolean := false;
+    BEGIN
+        BEGIN
+            PERFORM apply_vote(v_new, v_b, v_a, 0::real);
+        EXCEPTION WHEN unique_violation THEN
+            v_ok := true;
+        END;
+        PERFORM assert_true(v_ok, 'weight 0 でも同じペアへの再投票は拒否される（通常の票と区別が付かない）');
+    END;
+
+    -- 通常の票は従来どおり効く
+    PERFORM apply_vote((SELECT id FROM users WHERE handle = 'user3'), v_a, v_b, 1.0::real);
+    PERFORM assert_true(
+        (SELECT vote_count FROM post_community_scores WHERE post_id = v_a) = v_n_before + 1,
+        'weight 1 の票は従来どおり vote_count を増やす');
+    PERFORM assert_true(
+        (SELECT elo_rating FROM post_community_scores WHERE post_id = v_a) > v_elo_before,
+        'weight 1 の票は従来どおり Elo を動かす');
+
+    -- 負の weight は依然として拒否
+    DECLARE v_neg boolean := false;
+    BEGIN
+        BEGIN
+            INSERT INTO votes (voter_id, winner_post_id, loser_post_id, weight)
+            VALUES ((SELECT id FROM users WHERE handle = 'user4'), v_a, v_b, -1.0);
+        EXCEPTION WHEN check_violation THEN
+            v_neg := true;
+        END;
+        PERFORM assert_true(v_neg, '負の weight は拒否される');
+    END;
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 27. M-6 保留帯（held）の投稿は公開経路から消える =='
+-- ===========================================================================
+-- SEC-TRUST-02: trust_score < 0.40 は「非公開 + レビューキュー行き」。
+DO $$
+DECLARE
+    v_grain    smallint := (SELECT v FROM t_grain WHERE k = 'grain');
+    v_author   uuid     := (SELECT id FROM users WHERE handle = 'user5');
+    v_truleset smallint := (SELECT id FROM trust_rulesets WHERE is_active);
+    v_period   bigint   := (SELECT id FROM ranking_periods ORDER BY id LIMIT 1);
+    v_spot     uuid     := (SELECT v FROM t_ids WHERE k = 'spot_a');
+    v_ident    uuid     := (SELECT v FROM t_ids WHERE k = 'identity_a');
+    v_post     uuid;
+BEGIN
+    INSERT INTO posts (author_id, status, captured_at, weather, timeslot, season, location_privacy)
+    VALUES (v_author, 'published', now(), 'clear', 'noon', 'summer', 'hidden')
+    RETURNING id INTO v_post;
+    INSERT INTO post_spot_assignment (post_id, grain_version_id, spot_id, h3_index, bearing_sector, bind_method)
+    VALUES (v_post, v_grain, v_spot, 617700169958293503, 1, 'poi');
+    INSERT INTO post_discovery_labels (period_id, grain_version_id, post_id, spot_id, spot_identity_id, kind)
+    VALUES (v_period, v_grain, v_post, v_spot, v_ident, 'new_scenery');
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_post_recognition WHERE post_id = v_post),
+        1, '前提: 公開中の投稿は v_post_recognition に1行返る');
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_post_location_public WHERE post_id = v_post),
+        1, '前提: 公開中の投稿は v_post_location_public に出る');
+
+    -- 保留帯の判定を書き込む
+    INSERT INTO post_trust_scores (post_id, ruleset_id, trust_score, signals, band)
+    VALUES (v_post, v_truleset, 0.20, '{}'::jsonb, 'held');
+
+    PERFORM assert_eq(
+        (SELECT status FROM posts WHERE id = v_post), 'hidden'::post_status,
+        '保留帯の判定が入ると投稿は非公開になる（SEC-TRUST-02）');
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_post_recognition WHERE post_id = v_post),
+        0, '非公開の投稿は v_post_recognition から消える');
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_post_location_public WHERE post_id = v_post),
+        0, '非公開の投稿は座標ビューからも消える（ランキング再生成を待たない）');
+
+    -- レビューキューは既存の部分索引で引ける
+    PERFORM assert_true(
+        EXISTS (SELECT 1 FROM post_trust_scores WHERE band <> 'normal' AND post_id = v_post),
+        'レビューキューは post_trust_scores の band で引ける');
+
+    -- 保留から出ても自動では公開に戻らない（レビューの判断を上書きしないため）
+    UPDATE post_trust_scores SET band = 'normal', trust_score = 0.80 WHERE post_id = v_post;
+    PERFORM assert_eq(
+        (SELECT status FROM posts WHERE id = v_post), 'hidden'::post_status,
+        '保留から出ても自動では公開に戻さない（復帰はレビューを通す）');
+END;
+$$;
+
+
+-- ===========================================================================
+\echo '== 28. M-6 非公開の投稿は称号・順位ビューにも出ない =='
+-- ===========================================================================
+DO $$
+DECLARE
+    v_ident uuid := (SELECT v FROM t_ids WHERE k = 'identity_a');
+    v_post  uuid;
+    v_before_titles int;
+    v_before_display int;
+BEGIN
+    SELECT post_id INTO v_post FROM v_spot_titles WHERE spot_identity_id = v_ident LIMIT 1;
+    IF v_post IS NULL THEN
+        RAISE NOTICE '  skip 称号ビューに対象が無いため省略';
+        RETURN;
+    END IF;
+
+    SELECT count(*) INTO v_before_titles  FROM v_spot_titles   WHERE post_id = v_post;
+    SELECT count(*) INTO v_before_display FROM v_post_display  WHERE post_id = v_post;
+    PERFORM assert_true(v_before_titles > 0, '前提: 称号ビューに出ている');
+
+    UPDATE posts SET status = 'hidden' WHERE id = v_post;
+
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_spot_titles WHERE post_id = v_post),
+        0, '非公開にすると称号ビューから消える');
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_post_display WHERE post_id = v_post),
+        0, '非公開にすると順位ビューから消える');
+
+    UPDATE posts SET status = 'published' WHERE id = v_post;
+    PERFORM assert_eq(
+        (SELECT count(*)::int FROM v_spot_titles WHERE post_id = v_post),
+        v_before_titles, '公開に戻せば称号も戻る');
+END;
+$$;
+
+
 \echo ''
 \echo 'ALL SMOKE TESTS PASSED'
 ROLLBACK;

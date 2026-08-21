@@ -84,7 +84,8 @@ P-01 を選んだ結果、有名スポットは希少性②がほぼ0、無名�
 ### 順位を出すか発見表現にするかは一意に決まる
 
 ランキングが成立しなかった投稿は「順位なし」で放置せず、必ず `post_discovery_labels` に落とす。
-API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件につき必ず1行返る。
+API は `v_post_recognition`（両者の UNION）だけを見る。**公開中の**投稿1件につき必ず1行返る。
+非公開（`posts.status='hidden'`。転載検出と trust の保留帯）の投稿は0行になる（`0015`）。
 
 段を下げるとき、**上の段で既に順位が付いた投稿を母数に数えない**（docs/01 §9.3）。
 数えると `facet_post_count` が嘘になる。
@@ -134,7 +135,7 @@ API は `v_post_recognition`（両者の UNION）だけを見る。投稿1件に
 
 ```
 docs/          設計ドキュメント（日本語）
-db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0014、連番・追記のみ）
+db/migrations/ PostgreSQL 16 + PostGIS スキーマ（0001〜0015、連番・追記のみ）
 db/tests/      スキーマと関数のスモークテスト
 scoring/       ファセット導出規則（標準ライブラリのみ）
 core/          デプロイ単位が共有するドメイン層（h3-py + psycopg）

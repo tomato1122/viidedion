@@ -251,7 +251,7 @@ commit されないまま 1時間経過した `posts.status='pending'` は行を
 Strava の privacy zone と同型の仕組みを実装する。
 
 ```sql
--- 0008 以降のマイグレーションで追加する（スキーマ仕様）
+-- 仕様。実装は 0011_trust_and_privacy.sql
 CREATE TABLE user_privacy_zones (
     id          bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     user_id     uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -348,10 +348,22 @@ trust_score ∈ [0.0, 1.0]。基準値 0.6 から各シグナルを加減算し 
 - 誤検知への配慮: 抑制帯はユーザーに通知しない（サイレント抑制）。保留帯のみ通知する。
   抑制の透明性よりも、攻撃者に閾値を学習させないことを優先する（A4資産の保護）
 
+**保留帯の「非公開」の実装（`0015`）**: `post_trust_scores` のトリガが `band='held'` の投稿を
+`posts.status = 'hidden'` にする。**非公開の表現を新設せず、0002 の `hidden`（転載検出用）に
+合流させた** —— 公開経路が増えるたびに条件を書き写す設計は必ずどこかで漏れる。
+`rebuild_ranking_entries` は元から `status = 'published'` で母数を絞っているので、次の再生成で
+ランキングからも落ちる。ただし再生成を待つと非公開が遅れるため、公開ビュー
+（`v_post_display` / `v_post_recognition` / `v_spot_titles` / `v_post_location_public`）も
+`status` を見るようにした。
+
+**保留から出ても自動では公開に戻さない。** 転載検出で `hidden` にした投稿を trust の再計算が
+勝手に公開してしまうため。復帰はレビューを通す。レビューキューは既存の部分索引
+（`post_trust_band_idx`）でそのまま引ける。
+
 ### SEC-TRUST-03（MUST）スキーマ
 
 ```sql
--- 0008 以降のマイグレーションで追加する（スキーマ仕様）
+-- 仕様。実装は 0011_trust_and_privacy.sql
 CREATE TABLE trust_rulesets (            -- scoring_rulesets と同型
     id smallint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     code text NOT NULL UNIQUE,
@@ -392,6 +404,13 @@ CREATE TABLE post_trust_scores (
 
 - 作成24時間未満のアカウントの票は **weight 0 で記録**（受け付けるが効かせない。
   拒否すると攻撃者に検知される —— シャドウバン方式）
+
+  **✅ 実装済み（`0015`）**: `votes_weight_ck` を `weight >= 0` に緩め、`apply_vote` が
+  weight 0 の票を **`vote_count` にも数えない**ようにした。制約を緩めるだけでは不十分だった
+  —— `vote_count` は `calc_community_score` の縮約項 `confidence = n / (n + shrink_m)` に
+  効くので、票を投げるほど③の確定値が中央値から離れる。**weight 0 でもスコアが動いていた。**
+  `votes` の行は残すので、voter × pair のユニーク制約が効き続け、攻撃者からは通常の票と
+  区別が付かない。
 - `users.vote_trust`（既存カラム）を投票の weight に乗算。異常パターン
   （特定ユーザーへの一方的連続投票、同一IPからの多アカウント投票）の検知で下げる
 - 投票レート制限は SEC-API-02 の通り
@@ -487,6 +506,13 @@ CREATE TABLE post_trust_scores (
      `h3_cell_centers`（セルごとに1行）を引く形にしたので、
      **投稿ごとにジッターを入れる場所が構造として存在しない**
    - 座標を返してよいのは `v_post_location_public` だけ
+1b. ~~**SEC-VOTE-02 / SEC-TRUST-02 がスキーマ側で成立しない問題**~~
+   **✅ 完了（`0015_vote_weight_and_held.sql`）**
+   - `votes_weight_ck` が `weight > 0` を要求していて、SEC-VOTE-02 の weight 0 が
+     そもそも INSERT できなかった。緩和に加えて、weight 0 を `vote_count` に
+     数えないよう `apply_vote` を直した（数えるとシャドウバン票でもスコアが動く）
+   - SEC-TRUST-02 の保留帯が `band` を保存するだけで、非公開にする経路が無かった。
+     トリガで `posts.status = 'hidden'` に合流させ、公開ビュー4本が `status` を見るようにした
 2. **SEC-PRIV-01 の CI テスト**（EXIF除去検証）。ingest 実装（T-13）より先に
    テストだけ書いておく（実装がテストを追う形にする）
 3. **SEC-AUTH-02 のトークン検証ミドルウェア**（API 実装 T-19 の最初のコミット）
