@@ -248,6 +248,45 @@ T-16（DBSCAN昇格）が投稿の紐付けを張り替えると、`post_rarity_
 
 ---
 
+## レビュー所見: `0015`（M-1/M-6修正）の `v_post_display` リグレッション — マージ保留中
+
+**2026-08-15、他セッション（`claude/multiple-sessions-claude-md-check-gkb0td`、Architecture Lead）が
+M-1/M-6 を解消する `0015_vote_weight_and_held.sql` を作成した。中身自体（weight=0 を
+`vote_count`/Eloに反映させない修正・`held`帯を`posts.status='hidden'`へ合流させるトリガー・
+4本の公開ビューの`status`フィルタ追加）は丁寧で、付属のスモークテスト（新規28項目）も全件
+パスしている。** ただし別途レビューで1点リグレッションを発見したため、**この migration は
+`claude/new-session-6tt4vk` にまだ取り込んでいない（開発者の判断待ち、2026-08-15）**。
+
+```
+REVIEW_FINDING（DESIGN_DECISION_REQUIRED ではなく、事実として確認済みの不具合報告）
+
+気づいた状況:
+- 0015 は `v_post_display` を DROP VIEW → CREATE VIEW し直しているが、
+  再定義の SELECT 一覧が 0009_ranking_fallback.sql（h1aszd 側の作業、既に main に統合済み）
+  が追加した4列を含んでいない: spot_identity_id, spot_slug, facet_level, facet_label
+- あわせて spot_name の式が `COALESCE(i.canonical_name, s.display_name)` から
+  単純な `s.display_name` に戻っている（spot_identity 経由の正式名称フォールバックが消える）
+- `claude/multiple-sessions-claude-md-check-gkb0td` を worktree でチェックアウトし、
+  マイグレーションを適用して `\d v_post_display` で実測して確認済み（推測ではない）。
+  4列が実際に無い
+
+影響範囲:
+- `v_post_display`（公開ビュー）。現状 api/ のどのエンドポイントもこれらの列を参照していない
+  ため、今の api/ コードは壊れない。ただし T-01 の完了条件
+  （「粒度変更してもスポットURLと称号履歴が維持される」）を UI 側が確認する手段が
+  この4列だった可能性が高く、将来 T-20（クライアント）がこのビューを使うと気づきにくい欠損になる
+
+現在の実装への影響:
+- 0015 は `claude/new-session-6tt4vk` に未取り込み。M-1/M-6 自体は main 未統合のため
+  引き続き未解消のまま
+
+判断されるまで:
+- 開発者が Architecture Lead 側に修正を依頼するか、修正版を待つ
+- Implementation Lead は 0015 を書き換えない（migration は Architecture Lead 所有 — docs/07 §6）
+```
+
+---
+
 ## サブからの提案: `posts.captured_at` とアップロード2段フローの矛盾
 
 ```
