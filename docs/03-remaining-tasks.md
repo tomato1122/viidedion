@@ -1,10 +1,19 @@
 # 残タスク一覧
 
-> 最終更新: 2026-08-14
+> 最終更新: 2026-08-22
 > Notion の [残タスク一覧](https://app.notion.com/p/3ba7066098c28199b6cfd5a5254dce31) と同じ内容。**片方だけ更新しないこと。**
 >
 > 出典の `B-xx` / `G-xx` は [設計レビュー指摘書](https://app.notion.com/p/3ba7066098c281d2a67def2da8717255) の項番。
 > `P-xx` は [docs/05-product-decisions.md](05-product-decisions.md) のプロダクト決定。
+> 複数AIエージェントの役割分担・並行開発ルールは [docs/07-agent-roles.md](07-agent-roles.md)（Notion側が正）。
+>
+> **2026-08-22: Notion側の記載と本リポジトリ（main）の実体を突き合わせた結果、
+> Notionが「完了」としていた項目のうち以下は main のどのコミットにも実体が無いことを確認した**
+> （`git ls-tree` で全ブランチ・全PRを確認済み）。Notion側は誤記として修正する
+> （docs/07 §11・§15「教訓」）。
+> - M-1 / M-6 の修正（migration `0015`）— **未着手。下記「M-1 / M-6 資料間の矛盾」参照**
+> - T-19 の `api/` 部分実装（地図クラスタ・スポット詳細・SAS発行等）— **未着手。`api/` はリポジトリに存在しない**
+> - `docs/07-agent-roles.md` 自体 — 本コミットで新規作成し、リンク切れを解消した
 
 > **2026-08-13: プロダクト決定 P-01〜P-08 が確定した**（`docs/05-product-decisions.md`）。
 > 未決定は P-09（物理的な安全と誘導リスク。公開ローンチ前が期限）のみ。
@@ -51,6 +60,48 @@
 | B-06 位置情報の公開安全要件 | プライバシーゾーン・ブロックリスト・グリッドスナップ。表示座標は投稿に持たせず `h3_cell_centers` を引く（ジッターを入れる場所が構造として無い） |
 | B-11 POIソースのライセンス未確認 | ADR-001。**Azure Maps の規約に反していたことが判明**し、OSM（ODbL）へ変更。保持上限を CHECK 制約に |
 | G-05 / G-07 粒度の失敗モードとバージョン管理 | 監視指標を `v_grain_health` として実装。Blue-Green移行手順を定義 |
+
+---
+
+## M-1 / M-6 資料間の矛盾（未解決・DESIGN_DECISION_REQUIRED）
+
+2026-08-22、`docs/04-security-design.md` が MUST として書いた要件と、実際のスキーマ
+（`db/migrations/`）を突き合わせて見つかった不整合。**T-13（ingest）・T-19（API）が
+投票・信頼度判定に触る前に解消する必要がある。** 修正は `db/migrations/` への変更
+（CHECK制約・トリガ）を伴うため、docs/07 §6 により Architecture Lead の承認が必要。
+Implementation Lead 側では未着手・未修正のまま記録するに留めた。
+
+| ID | 内容 | 現状 |
+|---|---|---|
+| M-1 | `votes_weight_ck`（`0004_scoring.sql`）が `CHECK (weight > 0 AND weight <= 3.0)` になっており、SEC-VOTE-02（作成24時間未満のアカウントの票を **weight 0** で記録するシャドウバン方式。`docs/04 §7`）の INSERT を拒否する | 未修正。T-19 の投票APIが実装された瞬間に踏む |
+| M-6 | SEC-TRUST-02（`docs/04 §6`）は `trust_score` の保留帯（`band='held'`）を「非公開 + レビューキュー行き」と定義しているが、`post_trust_scores.band` に保存できるだけで、`v_post_display` / `v_post_recognition` / `v_post_location_public` のいずれも `band` を見ておらず非公開化する仕組みが無い | 未修正。副次的に `v_post_location_public` は `status`（投稿の公開状態）も見ておらず、pending/hidden 投稿の粗い位置まで返り得る |
+
+```
+DESIGN_DECISION_REQUIRED
+
+気づいた状況:
+- docs/04 SEC-VOTE-02 / SEC-TRUST-02 の受け入れ条件を db/migrations/ の実装と突き合わせたところ、
+  上記2件が成立していないことが分かった（M-1, M-6）
+
+影響範囲:
+- DB（CHECK制約・公開ビュー） / セキュリティ設計（SEC-VOTE-02, SEC-TRUST-02）
+
+現在の実装への影響:
+- T-19 の投票API・T-13 の trust_score 判定はこの2件を踏まえた migration が無いと着手できない
+
+提案:
+- A案: votes_weight_ck を `CHECK (weight >= 0 AND weight <= 3.0)` に緩和し、
+  `apply_vote`（未実装）側で weight=0 の票を community_shrink の vote_count に数えないよう実装する
+  （数えると縮約の confidence にシャドウバン票が影響してしまうため）
+- B案: 公開ビュー（v_post_display 等）に `band <> 'held'` のフィルタを追加する。
+  もしくはトリガで `band='held'` を既存の `posts.status='hidden'` に合流させ、公開ビューは
+  既存の status 判定だけで済むようにする
+- 推奨案: 未定（Architecture Lead 判断待ち）
+
+判断されるまで:
+- votes / post_trust_scores 関連の新規 migration は作らない
+- T-19 の投票エンドポイント・T-13 の trust_score 反映は着手しない
+```
 
 ---
 

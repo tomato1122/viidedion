@@ -20,11 +20,20 @@ Instagram はフォロワー数が権力になる構造で後発ユーザーが�
 | [docs/05-product-decisions.md](docs/05-product-decisions.md) | **プロダクト決定記録**。P-01〜P-08 は決定済み（2026-08-13）。未決定は P-09 のみ |
 | [docs/06-adr-poi-source.md](docs/06-adr-poi-source.md) | **ADR-001 POIソースの選定**。OSM採用の根拠と引き受けた義務。T-05 |
 | [docs/adr/](docs/adr/) | **ADR**。技術決定の記録。決定を覆すときは書き換えず新しい ADR を足す |
+| [docs/07-agent-roles.md](docs/07-agent-roles.md) | **複数AIエージェントの役割分担・並行開発ルール**（Notion側が正）。ADRやDBマイグレーションを書く前に必ず確認する |
 
 設計レビュー指摘書が Notion にある（B-01〜B-12）。**未対応の指摘が残っているので、
 新しい設計判断をする前に docs/03 の Phase 0 を確認すること。**
 B-01（永続ID）・B-03（ランキングの受け皿）・B-05/B-06（docs/04）・B-11（docs/06）は対応済み。
 残る Phase 0 は **T-31（認証）** のみ。
+
+**複数のAIエージェント（Architecture Lead = ChatGPT / Implementation Lead = Claude /
+Research Lead = Gemini）が並行して設計・実装を進める体制になっている。**
+ADR作成・DBスキーマ変更・マイグレーション採番は Architecture Lead の承認が必須
+（`docs/07-agent-roles.md` §2, §5, §6）。着手前に必ず最新 `origin/main` を確認し、
+判断が必要になった時点で実装を止めて `DESIGN_DECISION_REQUIRED` 形式で提案する（同 §8）。
+**Notion とリポジトリ（main）が食い違う場合、実体（コミット・ファイル）が無い方を誤記として
+扱い、main を正とする**（`docs/07-agent-roles.md` §3, §11）。
 
 ---
 
